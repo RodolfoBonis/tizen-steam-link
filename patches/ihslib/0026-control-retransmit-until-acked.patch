@@ -1,0 +1,402 @@
+Resend a control-channel packet until it is acknowledged, with gap-free backpressure.
+
+A reliable packet was resent every 10 ms, at most 20 times, then dropped. On TV Wi-Fi a stall
+over ~200 ms (a background scan or power save, every few minutes) used up all 20 resends and
+the packet was lost. On the control channel that packet carries HID input: a lost one blocks
+the host's ordered channel or desyncs the controller, which freezes input. Steam's own client
+resends until the packet is acknowledged, which is why a Steam Deck on the same Wi-Fi doesn't
+freeze.
+
+Control-channel reliable packets now keep retransmitting until acknowledged or the session ends
+(IHS_RetransmissionKeepGoing), with backoff that only applies to the control channel - 10 ms
+doubling, capped at 200 ms (IHS_RetransmissionBackoffMs); other channels keep the old fixed
+10 ms over 20 attempts. retransmitCount saturates at 255 instead of wrapping, which would reset
+the backoff.
+
+"Until acknowledged" must not run away, and it must stay gap-free: a reliable control packet
+that is dropped after an id was assigned leaves a permanent hole in the host's ordered channel
+and head-of-line-blocks everything after it, including a later full-report resync (a higher id).
+So nothing with a packetId is ever dropped. Three mechanisms bound the backlog instead:
+
+- HID backpressure at generation. IHS_SessionHIDSendReport reads the live control backlog and,
+  once it is at a soft cap (IHS_RETRANSMISSION_CONTROL_SOFT_CAP, 512, ~2 s of HID at 250 Hz),
+  skips the report *before* packing consumes a packetId or an encryption sequence. It resets the
+  holders so stale deltas don't pile up, counts it (hidReportsSkipped) and latches a resync.
+  Already-queued packets keep retransmitting with backoff until ACKed. When the backlog drains
+  back below a watermark (SOFT_CAP/2, hysteresis), the next batch is sent as full reports so the
+  host resyncs promptly; the full report is rebuilt from each holder's own last state
+  (IHS_HIDReportHolderResyncFull), under the holder lock, never touching managed->device, which
+  a concurrent DeviceClose on the receive thread may be freeing.
+
+- A hard cap for non-HID control traffic, which is never throttled. It may exceed the soft cap,
+  but at IHS_RETRANSMISSION_CONTROL_HARD_CAP (4096, still well under the int16 wraparound limit)
+  a queue attempt Warns and disconnects rather than drop a packet and gap the channel.
+
+- A zombie guard. A resend is handed to the send thread, which re-queues a fresh pending; an ACK
+  landing in between marked only the old pending, so the new one would resend forever. Both
+  IHS_RetransmissionQueue and the timer now drop a packet a cumulative ACK has already covered
+  (the per-channel acked id from 0025).
+
+Session teardown still frees pending items: the timer is destroyed first, running each task's end
+callback, then Deinit frees the rest. The backlog gauges (controlPending, controlMaxRetransmit,
+hidReportsSkipped) feed the diagnostics in 0024.
+
+diff --git a/src/hid/report.c b/src/hid/report.c
+index 0fbc22f..2580a5a 100644
+--- a/src/hid/report.c
++++ b/src/hid/report.c
+@@ -114,6 +114,18 @@ void IHS_HIDReportHolderAddFull(IHS_HIDReportHolder *holder, const uint8_t *curr
+     holder->report.n_reports = holder->reportItems.size;
+ }
+ 
++void IHS_HIDReportHolderResyncFull(IHS_HIDReportHolder *holder) {
++    // Resync the host after control backpressure skipped reports, without touching the device (it
++    // may be closing on another thread). Drop whatever this batch queued and re-send the holder's
++    // own last known state as a full report. ResetMessage promotes any pendingCurrent to lastSent,
++    // so lastSent is the most recent state the device produced - the same bytes the device would
++    // pack, matching the state later deltas are computed against, so the host's CRC checks pass.
++    IHS_HIDReportHolderResetMessage(holder);
++    if (holder->lastSent != NULL && holder->lastSentLen > 0) {
++        IHS_HIDReportHolderAddFull(holder, holder->lastSent, holder->lastSentLen);
++    }
++}
++
+ void IHS_HIDReportHolderAddDelta(IHS_HIDReportHolder *holder, const uint8_t *previous, const uint8_t *current,
+                                  size_t len) {
+     if (DedupAndStash(holder, current, len)) {
+diff --git a/src/hid/report.h b/src/hid/report.h
+index 97ec564..97a2ae8 100644
+--- a/src/hid/report.h
++++ b/src/hid/report.h
+@@ -85,6 +85,13 @@ void IHS_HIDReportHolderSetReportLength(IHS_HIDReportHolder *holder, size_t repo
+ 
+ void IHS_HIDReportHolderAddFull(IHS_HIDReportHolder *holder, const uint8_t *current, size_t len);
+ 
++/**
++ * Queue a full report of the holder's last known state (lastSent), discarding anything already
++ * queued this batch. Used to resync the host after control backpressure skipped reports. A no-op
++ * if nothing has been sent yet. Touches only the holder, never the device.
++ */
++void IHS_HIDReportHolderResyncFull(IHS_HIDReportHolder *holder);
++
+ void IHS_HIDReportHolderAddDelta(IHS_HIDReportHolder *holder, const uint8_t *previous, const uint8_t *current,
+                                  size_t len);
+ 
+diff --git a/src/session/channels/control/control_hid.c b/src/session/channels/control/control_hid.c
+index 4c6db7c..c64a8d1 100644
+--- a/src/session/channels/control/control_hid.c
++++ b/src/session/channels/control/control_hid.c
+@@ -226,6 +226,38 @@ bool IHS_SessionHIDSendReport(IHS_Session *session) {
+         free(disabledSnapshot);
+         return false;
+     }
++    // Generation-time backpressure. A report packed and sent below consumes a packetId and an
++    // encryption sequence; if the uplink is dead that copy is lost and its id becomes a permanent
++    // gap that head-of-line-blocks the host's ordered control channel - including any later resync
++    // report, which has a higher id. So once the control backlog is at its soft cap, skip the
++    // report *before* an id is consumed: reset the holders so stale deltas don't pile up, count it,
++    // and latch a resync. Already-queued packets keep retransmitting with backoff until acknowledged.
++    uint32_t controlPending = IHS_SessionCounterGet(session->counters.controlPending);
++    if (controlPending >= IHS_RETRANSMISSION_CONTROL_SOFT_CAP) {
++        size_t cappedCount;
++        IHS_HIDManagedDevice **cappedSnapshot = IHS_HIDManagerSnapshotOpenDevices(session->hidManager,
++                                                                                  &cappedCount);
++        for (size_t i = 0; i < cappedCount; ++i) {
++            IHS_MutexLock(cappedSnapshot[i]->lock);
++            IHS_HIDReportHolderResetMessage(&cappedSnapshot[i]->reportHolder);
++            IHS_MutexUnlock(cappedSnapshot[i]->lock);
++        }
++        free(cappedSnapshot);
++        IHS_SessionCounterAdd(session->counters.hidReportsSkipped, 1);
++        IHS_SessionCounterSet(session->counters.hidResyncNeeded, 1);
++        return false;
++    }
++    // Once the backlog has drained back below the watermark (hysteresis, so it doesn't flip-flop at
++    // the cap and doesn't regenerate full reports every 4 ms tick), clear the latch and make this
++    // batch carry full reports instead of deltas, so the host resyncs promptly without waiting to
++    // notice a CRC mismatch. Each full report is rebuilt from the holder's own last state under its
++    // lock (IHS_HIDReportHolderResyncFull) - we never touch managed->device here, which a concurrent
++    // DeviceClose on the receive thread may be freeing.
++    bool resync = IHS_SessionCounterGet(session->counters.hidResyncNeeded) != 0 &&
++                  controlPending < IHS_RETRANSMISSION_CONTROL_RESYNC_WATERMARK;
++    if (resync) {
++        IHS_SessionCounterSet(session->counters.hidResyncNeeded, 0);
++    }
+     CHIDMessageFromRemote outMessage = CHIDMESSAGE_FROM_REMOTE__INIT;
+     outMessage.command_case = CHIDMESSAGE_FROM_REMOTE__COMMAND_REPORTS;
+     CHIDMessageFromRemote__DeviceInputReports reports = CHIDMESSAGE_FROM_REMOTE__DEVICE_INPUT_REPORTS__INIT;
+@@ -246,6 +278,11 @@ bool IHS_SessionHIDSendReport(IHS_Session *session) {
+ 
+     IHS_ArrayListClear(&session->hidManager->inputReports);
+     for (size_t i = 0; i < deviceCount; ++i) {
++        if (resync) {
++            // Replace whatever this tick queued with a full report of the holder's last known
++            // state, so the host rebuilds from a known-good baseline. Touches only the holder.
++            IHS_HIDReportHolderResyncFull(&deviceSnapshot[i]->reportHolder);
++        }
+         IHS_HIDDeviceReportMessage *report = IHS_HIDReportHolderGetMessage(&deviceSnapshot[i]->reportHolder);
+         if (report == NULL) {
+             continue;
+diff --git a/src/session/retransmission.c b/src/session/retransmission.c
+index 6094975..efe2d97 100644
+--- a/src/session/retransmission.c
++++ b/src/session/retransmission.c
+@@ -28,6 +28,9 @@
+ 
+ #define RETRANSMISSION_INTERVAL 10
+ #define RETRANSMISSION_ATTEMPTS 20
++#define RETRANSMISSION_INTERVAL_MAX 200
++// retransmitCount is uint8_t on the wire; saturate here so it can't wrap.
++#define RETRANSMISSION_COUNT_MAX 255
+ 
+ /*
+  * A pending packet belongs to its timer task: the task's end callback takes it out of the queue
+@@ -59,6 +62,53 @@ bool IHS_RetransmissionSeqCovered(uint16_t id, uint16_t ackId) {
+     return (int16_t) (id - ackId) <= 0;
+ }
+ 
++bool IHS_RetransmissionKeepGoing(IHS_SessionChannelId channelId, uint8_t retransmitCount) {
++    // Control-channel packets carry HID input and session control; a lost one desyncs the host
++    // (a held button sticks and nothing else gets through), so keep resending until the packet is
++    // acknowledged or the session ends, as Steam's own client does. Other channels still give up.
++    if (channelId == IHS_SessionChannelIdControl) {
++        return true;
++    }
++    return retransmitCount < RETRANSMISSION_ATTEMPTS;
++}
++
++uint64_t IHS_RetransmissionBackoffMs(IHS_SessionChannelId channelId, uint8_t retransmitCount) {
++    // Only the control channel backs off, since it can retransmit for a long time; other channels
++    // keep the fixed interval across their attempts. retransmitCount counts the queued copy as 1,
++    // so the first resend waits 10 ms, then 20, 40, ... capped at 200 ms.
++    if (channelId != IHS_SessionChannelIdControl) {
++        return RETRANSMISSION_INTERVAL;
++    }
++    unsigned shift = retransmitCount > 0 ? (unsigned) (retransmitCount - 1) : 0;
++    if (shift > 5) {
++        shift = 5;  // 10 << 5 = 320 ms, past the cap anyway
++    }
++    uint64_t interval = (uint64_t) RETRANSMISSION_INTERVAL << shift;
++    return interval > RETRANSMISSION_INTERVAL_MAX ? RETRANSMISSION_INTERVAL_MAX : interval;
++}
++
++IHS_RetransmissionAction IHS_RetransmissionBacklogAction(IHS_SessionChannelId channelId, uint32_t pending) {
++    // By the time a packet reaches this queue it already carries a packetId and an encryption
++    // sequence, so dropping it here would leave a permanent gap in the host's ordered control
++    // channel and head-of-line-block everything after it - the very freeze we are fixing. HID
++    // backpressure is therefore applied earlier, at generation (IHS_SessionHIDSendReport), before
++    // an id is consumed. This hard cap only guards non-HID control traffic (never throttled)
++    // backing up behind a dead uplink: rather than drop and leave a gap, the session disconnects.
++    // It sits far above the HID soft cap yet well under 32768, so the cumulative-ACK wraparound
++    // compare (0025) stays valid.
++    if (channelId == IHS_SessionChannelIdControl && pending >= IHS_RETRANSMISSION_CONTROL_HARD_CAP) {
++        return IHS_RetransmissionActionDisconnect;
++    }
++    return IHS_RetransmissionActionQueue;
++}
++
++// Has a cumulative ACK already covered this id on the channel? Caller holds the lock.
++static bool RetransmissionCovered(IHS_SessionRetransmission *retransmission, IHS_SessionChannelId channelId,
++                                  uint16_t packetId) {
++    unsigned idx = RetransmissionChannelIndex(channelId);
++    return retransmission->ackedValid[idx] && IHS_RetransmissionSeqCovered(packetId, retransmission->ackedId[idx]);
++}
++
+ static void RetransmissionQueueItemDestroy(PendingRetransmission *item, void *context);
+ 
+ static uint64_t RetransmissionTimerRun(int runCount, void *context);
+@@ -85,26 +135,65 @@ void IHS_RetransmissionDeinit(IHS_SessionRetransmission *retransmission) {
+ bool IHS_RetransmissionQueue(IHS_SessionRetransmission *retransmission, IHS_SessionPacket *packet) {
+     assert(packet->body.data != NULL);
+     assert(packet->body.offset == IHS_PACKET_HEADER_SIZE);
+-    if (packet->header.retransmitCount >= RETRANSMISSION_ATTEMPTS) {
++    IHS_Session *session = retransmission->session;
++    IHS_SessionChannelId channelId = packet->header.channelId;
++    uint16_t packetId = packet->header.packetId;
++    uint16_t fragmentId = packet->header.fragmentId;
++    unsigned idx = RetransmissionChannelIndex(channelId);
++
++    IHS_MutexLock(retransmission->lock);
++    // A cumulative ACK may already cover this id (the send thread re-queues a resend the receive
++    // thread just acked). Dropping it here stops a zombie that would otherwise resend forever,
++    // since no further ACK will ever name it.
++    if (RetransmissionCovered(retransmission, channelId, packetId)) {
++        IHS_MutexUnlock(retransmission->lock);
++        return false;
++    }
++    // Last-resort guard on the control backlog: with the uplink dead but the downlink alive (video
++    // still arriving), the 10 s silence timeout never fires, so without this the queue, its timers
++    // and buffers would grow without bound. HID is already throttled at generation, so only non-HID
++    // control traffic can reach this cap; the packet here already owns a packetId, so dropping it
++    // would gap the ordered channel - disconnect instead.
++    if (IHS_RetransmissionBacklogAction(channelId, retransmission->pending[idx]) ==
++        IHS_RetransmissionActionDisconnect) {
++        IHS_MutexUnlock(retransmission->lock);
++        IHS_SessionLog(session, IHS_LogLevelWarn, "Retransmission",
++                       "Control backlog hit %u undelivered packets, disconnecting",
++                       (unsigned) IHS_RETRANSMISSION_CONTROL_HARD_CAP);
++        IHS_SessionDisconnect(session);
++        return false;
++    }
++    if (!IHS_RetransmissionKeepGoing(channelId, packet->header.retransmitCount)) {
++        IHS_MutexUnlock(retransmission->lock);
+         return false;
+     }
+     PendingRetransmission *pending = IHS_QueueItemObtain(retransmission->queue);
+     pending->packet = *packet;
+     pending->retransmission = retransmission;
+     pending->acked = false;
+-    pending->packet.header.retransmitCount++;
++    // retransmitCount is uint8_t on the wire; saturate so a long-lived control packet doesn't wrap
++    // back to 0 and reset its backoff.
++    if (pending->packet.header.retransmitCount < RETRANSMISSION_COUNT_MAX) {
++        pending->packet.header.retransmitCount++;
++    }
+     IHS_BufferTransferOwnership(&packet->body, &pending->packet.body);
+-    IHS_SessionLog(retransmission->session, IHS_LogLevelVerbose, "Retransmission",
+-                   "Queued Packet(channelId=%u, packetId=%u, fragmentId=%u), retransmitCount=%u",
+-                   pending->packet.header.channelId, pending->packet.header.packetId,
+-                   pending->packet.header.fragmentId, pending->packet.header.retransmitCount);
++    uint8_t retransmitCount = pending->packet.header.retransmitCount;
+     // In the queue before its task starts, so the end callback always finds it there. If the
+     // timer is already shutting down, no task starts and Deinit frees the item.
+-    IHS_MutexLock(retransmission->lock);
++    retransmission->pending[idx]++;
++    if (channelId == IHS_SessionChannelIdControl) {
++        IHS_SessionCounterSet(session->counters.controlPending, retransmission->pending[idx]);
++        if (retransmitCount > IHS_SessionCounterGet(session->counters.controlMaxRetransmit)) {
++            IHS_SessionCounterSet(session->counters.controlMaxRetransmit, retransmitCount);
++        }
++    }
+     IHS_QueueAppend(retransmission->queue, pending);
+     IHS_MutexUnlock(retransmission->lock);
+-    IHS_TimerTaskStart(retransmission->session->timers, RetransmissionTimerRun, RetransmissionTimerEnd,
+-                       RETRANSMISSION_INTERVAL, pending);
++    IHS_SessionLog(session, IHS_LogLevelVerbose, "Retransmission",
++                   "Queued Packet(channelId=%u, packetId=%u, fragmentId=%u), retransmitCount=%u",
++                   channelId, packetId, fragmentId, retransmitCount);
++    IHS_TimerTaskStart(session->timers, RetransmissionTimerRun, RetransmissionTimerEnd,
++                       IHS_RetransmissionBackoffMs(channelId, retransmitCount), pending);
+     return true;
+ }
+ 
+@@ -174,14 +263,15 @@ static uint64_t RetransmissionTimerRun(int runCount, void *context) {
+     (void) runCount;
+     PendingRetransmission *pending = context;
+     IHS_SessionRetransmission *retransmission = pending->retransmission;
++    IHS_SessionPacket *packet = &pending->packet;
++    IHS_SessionChannelId channelId = packet->header.channelId;
++    uint16_t packetId = packet->header.packetId;
+     IHS_MutexLock(retransmission->lock);
+-    bool acked = pending->acked;
++    // Skip the resend if an ACK marked this one, or a cumulative ACK has since covered its id.
++    bool skip = pending->acked || RetransmissionCovered(retransmission, channelId, packetId);
+     IHS_MutexUnlock(retransmission->lock);
+-    if (!acked) {
+-        IHS_SessionPacket *packet = &pending->packet;
+-        bool keepGoing = packet->header.retransmitCount < RETRANSMISSION_ATTEMPTS;
+-        IHS_SessionChannelId channelId = packet->header.channelId;
+-        uint16_t packetId = packet->header.packetId;
++    if (!skip) {
++        bool keepGoing = IHS_RetransmissionKeepGoing(channelId, packet->header.retransmitCount);
+         IHS_SessionQueuePacket(retransmission->session, packet, keepGoing);
+         assert(packet->body.data == NULL);
+         if (!keepGoing) {
+@@ -205,8 +295,15 @@ static void RetransmissionTimerEnd(void *context) {
+                    "Timer ended for Packet(channelId=%u, packetId=%u, fragmentId=%u), retransmitCount=%u",
+                    pending->packet.header.channelId, pending->packet.header.packetId, pending->packet.header.fragmentId,
+                    pending->packet.header.retransmitCount);
++    unsigned idx = RetransmissionChannelIndex(pending->packet.header.channelId);
+     IHS_MutexLock(retransmission->lock);
+     IHS_QueuePollBy(retransmission->queue, RetransmissionIdenticalPredicate, pending);
++    if (retransmission->pending[idx] > 0) {
++        retransmission->pending[idx]--;
++    }
++    if (pending->packet.header.channelId == IHS_SessionChannelIdControl) {
++        IHS_SessionCounterSet(retransmission->session->counters.controlPending, retransmission->pending[idx]);
++    }
+     IHS_MutexUnlock(retransmission->lock);
+     // Out of the queue, so no ACK can reach it now. Its body is still here if it was acknowledged.
+     IHS_SessionPacketClear(&pending->packet, true);
+diff --git a/src/session/retransmission.h b/src/session/retransmission.h
+index d99a2a3..cc95259 100644
+--- a/src/session/retransmission.h
++++ b/src/session/retransmission.h
+@@ -36,6 +36,18 @@ typedef struct IHS_Session IHS_Session;
+ // channels are unreliable and never come here. Sized to index by channelId directly.
+ #define IHS_RETRANSMISSION_CHANNELS 8
+ 
++// HID backpressure is applied at generation (IHS_SessionHIDSendReport): once this many control
++// packets await acknowledgement (~2 s of HID at 250 Hz), new HID reports are skipped before an id
++// is consumed instead of being queued and later dropped (which would gap the ordered channel).
++#define IHS_RETRANSMISSION_CONTROL_SOFT_CAP 512
++// Reports resume as full reports once the backlog drains back below this watermark (hysteresis),
++// so a backlog hovering at the cap does not flip-flop between skipping and sending.
++#define IHS_RETRANSMISSION_CONTROL_RESYNC_WATERMARK (IHS_RETRANSMISSION_CONTROL_SOFT_CAP / 2)
++// Last-resort guard for non-HID control traffic (never throttled) backing up behind a dead uplink:
++// at this many pending the session disconnects rather than grow the queue without bound. Well above
++// the soft cap yet well under 32768, so the cumulative-ACK wraparound compare stays correct.
++#define IHS_RETRANSMISSION_CONTROL_HARD_CAP 4096
++
+ typedef struct IHS_SessionRetransmission {
+     IHS_Session *session;
+     IHS_Mutex *lock;
+@@ -45,6 +57,9 @@ typedef struct IHS_SessionRetransmission {
+     // covered.
+     bool ackedValid[IHS_RETRANSMISSION_CHANNELS];
+     uint16_t ackedId[IHS_RETRANSMISSION_CHANNELS];
++    // Live count of pending (unacknowledged) packets per channel, under `lock`. The control
++    // backlog hard cap reads it, and it is kept < 32768 so the wraparound compare above stays valid.
++    uint32_t pending[IHS_RETRANSMISSION_CHANNELS];
+ } IHS_SessionRetransmission;
+ 
+ /**
+@@ -54,6 +69,34 @@ typedef struct IHS_SessionRetransmission {
+  */
+ bool IHS_RetransmissionSeqCovered(uint16_t id, uint16_t ackId);
+ 
++/**
++ * Whether a reliable packet should still be retransmitted. The control channel carries HID input
++ * and session control, so it keeps going until acknowledged or the session ends; other channels
++ * give up after a fixed number of attempts.
++ */
++bool IHS_RetransmissionKeepGoing(IHS_SessionChannelId channelId, uint8_t retransmitCount);
++
++/**
++ * Delay in milliseconds before the next retransmit. The control channel backs off (10 ms
++ * doubling, capped at 200 ms) because it can retransmit for a long time; other channels keep a
++ * fixed 10 ms across their attempts. \p retransmitCount counts the first send as 1.
++ */
++uint64_t IHS_RetransmissionBackoffMs(IHS_SessionChannelId channelId, uint8_t retransmitCount);
++
++/** What to do with a reliable packet given the current backlog on its channel. */
++typedef enum IHS_RetransmissionAction {
++    IHS_RetransmissionActionQueue,       /**< Queue it for retransmission as usual. */
++    IHS_RetransmissionActionDisconnect,  /**< Control backlog hit the hard cap; disconnect. */
++} IHS_RetransmissionAction;
++
++/**
++ * Decide what to do with a packet on \p channelId when \p pending packets already await
++ * acknowledgement there. Only the control channel is capped, and a queued packet already owns a
++ * packetId, so the only options are to queue it or (at the hard cap) disconnect; HID is throttled
++ * earlier, at generation, so it never reaches this cap.
++ */
++IHS_RetransmissionAction IHS_RetransmissionBacklogAction(IHS_SessionChannelId channelId, uint32_t pending);
++
+ void IHS_RetransmissionInit(IHS_SessionRetransmission *retransmission, IHS_Session *session);
+ 
+ void IHS_RetransmissionDeinit(IHS_SessionRetransmission *retransmission);
+diff --git a/src/session/session_pri.h b/src/session/session_pri.h
+index 68545f6..960eba4 100644
+--- a/src/session/session_pri.h
++++ b/src/session/session_pri.h
+@@ -95,6 +95,9 @@ typedef struct IHS_SessionCounters {
+     uint32_t controlMaxRetransmit;
+     /* HID reports skipped at generation because the control backlog was at its soft cap. */
+     uint32_t hidReportsSkipped;
++    /* Latch: set when a HID report is skipped at the soft cap, cleared when a later batch (once the
++     * backlog drains below the watermark) is sent as full reports, so the host resyncs on recovery. */
++    uint32_t hidResyncNeeded;
+     /* Diagnostics: times the HID poll timer ticked (the ihslib timer thread draining devices).
+      * Stops climbing if that thread stalls, so the overlay can tell whether input is polled at all. */
+     uint32_t hidPollTicks;

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "core/client.h"
+#include "core/diag.h"
 #include "core/gamepad.h"
 #include "core/identity.h"
 #include "core/keymap.h"
@@ -27,6 +28,7 @@ extern "C" {
 #include "hid/device.h"
 #include "hid/manager.h"
 #include "hid/provider.h"
+#include "hid/report.h"
 #include "ihs_buffer.h"
 #include "ihs_enumeration.h"
 #include "protobuf/discovery.pb-c.h"
@@ -36,6 +38,7 @@ extern "C" {
 #include "session/channels/ch_data_audio.h"
 #include "session/fec.h"
 #include "session/retransmission.h"
+#include "session/channels/channel.h"
 #include "session/session_pri.h"
 #include "session/window.h"
 }
@@ -930,10 +933,12 @@ void TestRetransmissionCancelRacesTimer() {
         return any;
     };
 
-    // Acknowledged well before its timer: cancelled once, and never sent again.
+    // Acknowledged well before its timer: cancelled once, and never sent again. Exact (NACK-style)
+    // cancelling keeps each queue/cancel pair to one packet id, so this isolates the ACK-vs-timer
+    // race without the cumulative coverage that TestCancelCumulativeVsExact checks.
     CHECK(queue(1));
-    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0));
-    CHECK(!IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0));
+    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0, false));
+    CHECK(!IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0, false));
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
     CHECK(!resent());
     // Not acknowledged: sent again when the timer fires.
@@ -951,7 +956,7 @@ void TestRetransmissionCancelRacesTimer() {
                 auto packetId = static_cast<uint16_t>(1000 + t * 1000 + i);
                 if (!queue(packetId)) notQueued++;
                 std::this_thread::sleep_for(std::chrono::microseconds(9000 + (i % 21) * 100));
-                IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, packetId, 0);
+                IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, packetId, 0, false);
             }
         });
     }
@@ -961,7 +966,420 @@ void TestRetransmissionCancelRacesTimer() {
     IHS_SessionDestroy(session);
 }
 
+
+// Full HID reports and the dedup. A full report the host asks for (RequestFullReport) must go
+// out even when the pad state is unchanged, or the host stays stuck on its stale copy and input
+// freezes. And a delta right after a full report in the same batch - Full(Y) then Delta(X) -
+// must survive, or the host ends at Y while the pad is at X.
+void TestFullReportDedup() {
+    IHS_HIDReportHolder holder;
+    IHS_HIDReportHolderInit(&holder, 1);
+    IHS_HIDReportHolderSetReportLength(&holder, 48);
+    uint8_t x[48] = {0};
+    x[0] = 0x11;
+    uint8_t y[48] = {0};
+    y[0] = 0x22;
+
+    // First full report is queued, then flushed (ResetMessage promotes it to "last sent").
+    IHS_HIDReportHolderAddFull(&holder, x, 48);
+    CHECK(IHS_HIDReportHolderGetMessage(&holder) != nullptr);
+    IHS_HIDReportHolderResetMessage(&holder);
+
+    // A delta with the identical state is dropped as a no-op.
+    IHS_HIDReportHolderAddDelta(&holder, x, x, 48);
+    CHECK(IHS_HIDReportHolderGetMessage(&holder) == nullptr);
+
+    // But a full report with that same state is still queued.
+    IHS_HIDReportHolderAddFull(&holder, x, 48);
+    IHS_HIDDeviceReportMessage *msg = IHS_HIDReportHolderGetMessage(&holder);
+    CHECK(msg != nullptr);
+    if (msg != nullptr) {
+        CHECK_EQ(msg->n_reports, 1u);
+        CHECK(msg->reports[0]->has_full_report);
+    }
+    IHS_HIDReportHolderResetMessage(&holder);
+
+    // Full(Y) then Delta(X) in one batch: the delta must not be dropped against the old lastSent.
+    IHS_HIDReportHolderAddFull(&holder, y, 48);
+    IHS_HIDReportHolderAddDelta(&holder, y, x, 48);
+    msg = IHS_HIDReportHolderGetMessage(&holder);
+    CHECK(msg != nullptr);
+    if (msg != nullptr) {
+        CHECK_EQ(msg->n_reports, 2u);          // the full report and the delta
+        CHECK(msg->reports[0]->has_full_report);
+        CHECK(msg->reports[1]->has_delta_report);
+    }
+    IHS_HIDReportHolderResetMessage(&holder);
+    IHS_HIDReportHolderDeinit(&holder);
+}
+
+// The pure retransmission policy helpers, no threads or timers: cumulative-ACK coverage with
+// 16-bit wraparound, when to keep retransmitting, the backoff schedule, and the backlog cap.
+void TestRetransmissionPolicy() {
+    // Cumulative coverage, wraparound included.
+    CHECK(IHS_RetransmissionSeqCovered(10, 10));
+    CHECK(IHS_RetransmissionSeqCovered(9, 10));
+    CHECK(!IHS_RetransmissionSeqCovered(11, 10));
+    CHECK(IHS_RetransmissionSeqCovered(65535, 1));   // 65535 is just before 1
+    CHECK(IHS_RetransmissionSeqCovered(0, 1));
+    CHECK(!IHS_RetransmissionSeqCovered(2, 1));
+
+    // Control keeps going past the 20-attempt cap; other channels give up at it.
+    CHECK(IHS_RetransmissionKeepGoing(IHS_SessionChannelIdControl, 20));
+    CHECK(IHS_RetransmissionKeepGoing(IHS_SessionChannelIdControl, 200));
+    CHECK(IHS_RetransmissionKeepGoing(IHS_SessionChannelIdStats, 19));
+    CHECK(!IHS_RetransmissionKeepGoing(IHS_SessionChannelIdStats, 20));
+
+    // Backoff: control doubles from 10 ms, capped at 200 ms; other channels stay at 10 ms.
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 1), 10u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 2), 20u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 3), 40u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 4), 80u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 5), 160u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 6), 200u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 200), 200u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdStats, 1), 10u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdStats, 7), 10u);
+
+    // Backlog hard cap: only the control channel is capped, and since a queued packet already owns
+    // a packet id the only options are to queue it or disconnect (HID is throttled earlier, at
+    // generation, so it never reaches here). Non-control channels are never capped.
+    uint32_t hard = IHS_RETRANSMISSION_CONTROL_HARD_CAP;
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, hard - 1),
+             IHS_RetransmissionActionQueue);
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, hard),
+             IHS_RetransmissionActionDisconnect);
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdStats, hard + 1000),
+             IHS_RetransmissionActionQueue);
+
+    // The thresholds are ordered watermark < soft cap < hard cap, and the hard cap stays under the
+    // 32768 the cumulative-ACK wraparound compare relies on.
+    CHECK(IHS_RETRANSMISSION_CONTROL_RESYNC_WATERMARK < IHS_RETRANSMISSION_CONTROL_SOFT_CAP);
+    CHECK(IHS_RETRANSMISSION_CONTROL_SOFT_CAP < IHS_RETRANSMISSION_CONTROL_HARD_CAP);
+    CHECK(IHS_RETRANSMISSION_CONTROL_HARD_CAP < 32768);
+}
+
+// Makes a session that sends nothing (not connected), so a retransmit stays in the send queue.
+// The caller owns it and must IHS_SessionDestroy it.
+IHS_Session *MakeLoopbackSession(uint8_t seed) {
+    static uint8_t random[tsl::Identity::kRandomBytes];
+    std::memset(random, 0, sizeof(random));
+    random[0] = seed;
+    tsl::Identity id = tsl::Identity::FromRandom(random, "test");
+    static IHS_ClientConfig config;
+    config = id.ClientConfig();
+    static tsl::HostKey key;
+    key = tsl::HostKey{};
+    config.secretKey = key.data();
+    IHS_SessionInfo info{};
+    IHS_IPAddressFromString(&info.address.ip, "127.0.0.1");
+    info.address.port = 27031;
+    info.sessionKeyLen = 32;
+    return IHS_SessionCreate(&config, &info);
+}
+
+// Queues a reliable packet on a channel with a given starting retransmitCount. Returns whether it
+// was queued (false if dropped as already-acked, over the cap, or past a channel's attempts).
+bool QueueReliable(IHS_SessionRetransmission *retransmission, IHS_SessionChannelId channelId, uint16_t packetId,
+                   uint8_t retransmitCount = 0) {
+    IHS_SessionPacket packet{};
+    packet.header.type = IHS_SessionPacketTypeReliable;
+    packet.header.channelId = channelId;
+    packet.header.packetId = packetId;
+    packet.header.retransmitCount = retransmitCount;
+    packet.header.sendTimestamp = IHS_SessionPacketTimestamp();
+    IHS_SessionPacketBodyInitialize(&packet.body, false);
+    const uint8_t payload[1] = {0};
+    IHS_BufferAppendMem(&packet.body, payload, sizeof(payload));
+    bool queued = IHS_RetransmissionQueue(retransmission, &packet);
+    IHS_SessionPacketClear(&packet, true);
+    return queued;
+}
+
+// Cancel semantics, checked synchronously by Cancel's return (true iff it marked a live packet),
+// no sleeps: an ACK is cumulative, a NACK is exact, and an ACK never covers a later id. Every
+// packet is on the control channel unless noted.
+void TestCancelCumulativeVsExact() {
+    IHS_Session *session = MakeLoopbackSession(5);
+    IHS_SessionRetransmission *r = &session->retransmission;
+    const IHS_SessionChannelId control = IHS_SessionChannelIdControl;
+    const bool ACK = true, NACK = false;
+
+    // Ids ascend through the test: a cumulative ACK advances the channel's acked id, so a later
+    // queue of a lower id would (correctly) be refused as already covered. Wraparound gets its
+    // own session below, with a fresh acked id.
+
+    // One cumulative ACK for the newest covers all five; a repeat finds none left.
+    for (uint16_t id = 100; id <= 104; id++) CHECK(QueueReliable(r, control, id));
+    CHECK(IHS_RetransmissionCancel(r, control, 104, 0, ACK));
+    CHECK(!IHS_RetransmissionCancel(r, control, 104, 0, ACK));
+
+    // An ACK for n does not cover n+1: 112 survives an ACK of 111, and a NACK is exact.
+    CHECK(QueueReliable(r, control, 111));
+    CHECK(QueueReliable(r, control, 112));
+    CHECK(IHS_RetransmissionCancel(r, control, 111, 0, ACK));   // marks 111 only
+    CHECK(!IHS_RetransmissionCancel(r, control, 111, 0, ACK));  // 111 gone, 112 not covered
+    CHECK(IHS_RetransmissionCancel(r, control, 112, 0, NACK));  // 112 still live, exact NACK marks it
+    CHECK(!IHS_RetransmissionCancel(r, control, 112, 0, NACK));
+
+    // A NACK is not cumulative and does not advance the acked id: NACK(122) must not touch the
+    // earlier 120 and 121, which stay live for their own exact cancels.
+    CHECK(QueueReliable(r, control, 120));
+    CHECK(QueueReliable(r, control, 121));
+    CHECK(QueueReliable(r, control, 122));
+    CHECK(IHS_RetransmissionCancel(r, control, 122, 0, NACK));   // only 122
+    CHECK(!IHS_RetransmissionCancel(r, control, 122, 0, NACK));
+    CHECK(IHS_RetransmissionCancel(r, control, 120, 0, NACK));   // 120 was left live
+    CHECK(IHS_RetransmissionCancel(r, control, 121, 0, NACK));   // 121 was left live
+    IHS_SessionDestroy(session);
+
+    // Wraparound on a fresh session: one ACK for 1 covers 65534, 65535, 0 and 1.
+    IHS_Session *wrap = MakeLoopbackSession(9);
+    IHS_SessionRetransmission *rw = &wrap->retransmission;
+    CHECK(QueueReliable(rw, control, 65534));
+    CHECK(QueueReliable(rw, control, 65535));
+    CHECK(QueueReliable(rw, control, 0));
+    CHECK(QueueReliable(rw, control, 1));
+    CHECK(IHS_RetransmissionCancel(rw, control, 1, 0, ACK));
+    CHECK(!IHS_RetransmissionCancel(rw, control, 1, 0, ACK));
+    IHS_SessionDestroy(wrap);
+}
+
+// The zombie guard: once a cumulative ACK has covered an id on a channel, re-queuing a packet at
+// or before it is refused, so a resend the receive thread already acked can't loop forever.
+void TestRetransmitZombieGuard() {
+    IHS_Session *session = MakeLoopbackSession(6);
+    IHS_SessionRetransmission *r = &session->retransmission;
+    const IHS_SessionChannelId control = IHS_SessionChannelIdControl;
+
+    // A cumulative ACK for 500 advances the channel's acked id even with nothing pending.
+    CHECK(!IHS_RetransmissionCancel(r, control, 500, 0, true));
+    // Re-queuing a covered id is refused; a newer id still queues.
+    CHECK(!QueueReliable(r, control, 499));
+    CHECK(!QueueReliable(r, control, 500));
+    CHECK(QueueReliable(r, control, 501));
+    // A NACK does not advance the acked id, so it can't create this guard by itself.
+    IHS_Session *session2 = MakeLoopbackSession(7);
+    IHS_SessionRetransmission *r2 = &session2->retransmission;
+    CHECK(!IHS_RetransmissionCancel(r2, control, 500, 0, false));
+    CHECK(QueueReliable(r2, control, 499));  // not covered: a NACK didn't move the acked id
+
+    IHS_SessionDestroy(session);
+    IHS_SessionDestroy(session2);
+}
+
+// The control backlog gauge tracks pending packets, and acknowledging them clears it. (The cap
+// decision itself is covered deterministically by TestRetransmissionPolicy.)
+void TestControlBacklogGauge() {
+    IHS_Session *session = MakeLoopbackSession(8);
+    IHS_SessionRetransmission *r = &session->retransmission;
+    const IHS_SessionChannelId control = IHS_SessionChannelIdControl;
+
+    for (uint16_t id = 1; id <= 4; id++) CHECK(QueueReliable(r, control, id));
+    IHS_SessionStreamStats stats;
+    IHS_SessionGetStreamStats(session, &stats);
+    CHECK_EQ(stats.controlPending, 4u);
+    CHECK(stats.controlMaxRetransmit >= 1u);
+
+    // A cumulative ACK marks them acked; their timers then drop them and the gauge falls to 0.
+    CHECK(IHS_RetransmissionCancel(r, control, 4, 0, true));
+    for (int i = 0; i < 50; i++) {
+        IHS_SessionGetStreamStats(session, &stats);
+        if (stats.controlPending == 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK_EQ(stats.controlPending, 0u);
+    IHS_SessionDestroy(session);
+}
+
+
+// IHS_HIDReportHolderResyncFull rebuilds a full report from the holder's own last state, dropping
+// anything queued this batch. This is how a resync recovers after control backpressure skipped
+// reports, without touching the device (which a concurrent DeviceClose may be freeing).
+void TestResyncFull() {
+    IHS_HIDReportHolder holder;
+    IHS_HIDReportHolderInit(&holder, 2);
+    IHS_HIDReportHolderSetReportLength(&holder, 48);
+    uint8_t a[48] = {0};
+    a[0] = 0xAA;
+    uint8_t b[48] = {0};
+    b[0] = 0xBB;
+
+    // Nothing sent yet: resync has no baseline to resend, so it is a no-op.
+    IHS_HIDReportHolderResyncFull(&holder);
+    CHECK(IHS_HIDReportHolderGetMessage(&holder) == nullptr);
+
+    // Send a full report of A and flush it, so A becomes the last known state.
+    IHS_HIDReportHolderAddFull(&holder, a, 48);
+    IHS_HIDReportHolderResetMessage(&holder);
+
+    // Resync with nothing queued this batch: re-emits a single full report of A.
+    IHS_HIDReportHolderResyncFull(&holder);
+    IHS_HIDDeviceReportMessage *msg = IHS_HIDReportHolderGetMessage(&holder);
+    CHECK(msg != nullptr);
+    if (msg != nullptr) {
+        CHECK_EQ(msg->n_reports, 1u);
+        CHECK(msg->reports[0]->has_full_report);
+        CHECK_EQ(msg->reports[0]->full_report.data[0], 0xAA);
+    }
+    IHS_HIDReportHolderResetMessage(&holder);
+
+    // A delta to B queued this batch, then resync: the delta is dropped and replaced by a single
+    // full report of the most recent state, B (the host ends at B either way, but the full report
+    // doesn't depend on the host already holding A).
+    IHS_HIDReportHolderAddDelta(&holder, a, b, 48);
+    IHS_HIDReportHolderResyncFull(&holder);
+    msg = IHS_HIDReportHolderGetMessage(&holder);
+    CHECK(msg != nullptr);
+    if (msg != nullptr) {
+        CHECK_EQ(msg->n_reports, 1u);
+        CHECK(msg->reports[0]->has_full_report);
+        CHECK_EQ(msg->reports[0]->full_report.data[0], 0xBB);
+    }
+    IHS_HIDReportHolderResetMessage(&holder);
+    IHS_HIDReportHolderDeinit(&holder);
+}
+
+// Generation-time backpressure through production code (IHS_SessionHIDSendReport): at the soft cap
+// a report is skipped before it consumes a packet id, a resync latches, and once the backlog drains
+// below the watermark the next report resyncs with a full report. The gamepad slot is left neutral
+// the whole time, so the 250 Hz poll task never calls SendReport behind our back and the test stays
+// deterministic. The backlog level is set on the gauge the generation path actually reads; the
+// gauge's own queue/drain accounting is covered by TestControlBacklogGauge.
+void TestHIDBackpressureAndResync() {
+    IHS_Session *session = MakeLoopbackSession(11);
+    IHS_HIDProvider *provider = TSL_GamepadProviderCreate();
+    IHS_SessionHIDAddProvider(session, provider);
+    TSL_GamepadInfo info{};
+    info.vendorId = 0x045e;
+    info.productId = 0x02ea;
+    std::snprintf(info.name, sizeof(info.name), "Xbox Wireless Controller");
+    CHECK(TSL_GamepadProviderSetConnected(provider, 1, true, &info));
+    IHS_HIDManagedDevice *managed = IHS_HIDManagerOpenDevice(session->hidManager, "tsl://1");
+    CHECK(managed != nullptr);
+    if (managed == nullptr) {
+        IHS_SessionDestroy(session);
+        TSL_GamepadProviderDestroy(provider);
+        return;
+    }
+
+    // Give the device a baseline state, then flush it to lastSent without sending it (so no
+    // retransmission timers run and the backlog stays whatever we set it to).
+    IHS_HIDReportHolderSetReportLength(&managed->reportHolder, TSL_GAMEPAD_REPORT_SIZE);
+    CHECK_EQ(IHS_HIDDeviceStartInputReports(managed->device, TSL_GAMEPAD_REPORT_SIZE), 0);
+    IHS_MutexLock(managed->lock);
+    IHS_HIDReportHolderResetMessage(&managed->reportHolder);
+    IHS_MutexUnlock(managed->lock);
+
+    IHS_SessionChannel *control = IHS_SessionChannelFor(session, IHS_SessionChannelIdControl);
+    uint16_t idBefore = control->nextPacketId;
+
+    // 1) Backlog at the soft cap: skip before an id is consumed; count the skip and latch a resync.
+    IHS_SessionCounterSet(session->counters.controlPending, IHS_RETRANSMISSION_CONTROL_SOFT_CAP);
+    CHECK(!IHS_SessionHIDSendReport(session));
+    CHECK_EQ(control->nextPacketId, idBefore);
+    CHECK(IHS_SessionCounterGet(session->counters.hidReportsSkipped) >= 1u);
+    CHECK_EQ(IHS_SessionCounterGet(session->counters.hidResyncNeeded), 1u);
+
+    // 2) Between the watermark and the soft cap: no skip, but no resync either - the latch holds
+    //    (hysteresis), and nothing is sent because the holder is empty.
+    IHS_SessionCounterSet(session->counters.controlPending, IHS_RETRANSMISSION_CONTROL_RESYNC_WATERMARK + 1);
+    CHECK(!IHS_SessionHIDSendReport(session));
+    CHECK_EQ(control->nextPacketId, idBefore);
+    CHECK_EQ(IHS_SessionCounterGet(session->counters.hidResyncNeeded), 1u);
+
+    // 3) Drained below the watermark: the next report resyncs - it emits a full report rebuilt from
+    //    the holder even though the device produced nothing new, consuming exactly one id and
+    //    clearing the latch.
+    IHS_SessionCounterSet(session->counters.controlPending, 0);
+    CHECK(IHS_SessionHIDSendReport(session));
+    CHECK_EQ((uint16_t) (control->nextPacketId - idBefore), 1u);
+    CHECK_EQ(IHS_SessionCounterGet(session->counters.hidResyncNeeded), 0u);
+
+    // Close the device while the channels are still alive (as Steam's DeviceClose would), so the
+    // manager's close notification doesn't run against freed channels during IHS_SessionDestroy.
+    IHS_HIDManagerCloseAll(session->hidManager);
+    IHS_SessionDestroy(session);
+    TSL_GamepadProviderDestroy(provider);
+}
+
+// Non-HID control traffic is never throttled, so it can back up behind a dead uplink. At the hard
+// cap IHS_RetransmissionQueue refuses the packet (rather than drop it and gap the ordered channel)
+// and disconnects the session. Below the cap the same queue succeeds.
+void TestControlHardCapDisconnect() {
+    IHS_Session *session = MakeLoopbackSession(12);
+    IHS_SessionRetransmission *r = &session->retransmission;
+    const IHS_SessionChannelId control = IHS_SessionChannelIdControl;
+
+    // Simulate a backlog already at the hard cap. No provider or timers run on this session, so the
+    // pending count stays put; the queue/drain accounting is covered by TestControlBacklogGauge.
+    r->pending[control] = IHS_RETRANSMISSION_CONTROL_HARD_CAP;
+    CHECK(!QueueReliable(r, control, 7));
+
+    // IHS_SessionDisconnect queues a disconnect packet on the discovery channel via a 0 ms timer;
+    // wait for it (bounded, exits as soon as seen) to confirm the production disconnect path ran.
+    bool disconnected = false;
+    for (int i = 0; i < 100; i++) {
+        IHS_MutexLock(session->sendQueueMutex);
+        disconnected = !IHS_QueueIsEmpty(session->sendQueue);
+        IHS_MutexUnlock(session->sendQueueMutex);
+        if (disconnected) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(disconnected);
+
+    // Below the hard cap, a queue attempt is accepted again.
+    r->pending[control] = IHS_RETRANSMISSION_CONTROL_HARD_CAP - 1;
+    CHECK(QueueReliable(r, control, 8));
+
+    IHS_SessionDestroy(session);
+}
+
 }  // namespace
+
+static void TestMaxWindow() {
+    tsl::MaxWindow w;
+    // Empty: both the window and the session peak are zero.
+    CHECK_EQ(w.Window(), 0u);
+    CHECK_EQ(w.Max(), 0u);
+
+    w.Record(5);
+    w.Record(3);  // smaller: ignored by both
+    w.Record(8);
+    CHECK_EQ(w.Window(), 8u);
+    CHECK_EQ(w.Max(), 8u);
+
+    // TakeWindow returns the window's peak and resets the window, but not the session peak.
+    CHECK_EQ(w.TakeWindow(), 8u);
+    CHECK_EQ(w.Window(), 0u);
+    CHECK_EQ(w.Max(), 8u);
+
+    // A quieter window: its own peak, while the session peak stays at the earlier high.
+    w.Record(4);
+    CHECK_EQ(w.Window(), 4u);
+    CHECK_EQ(w.Max(), 8u);
+    CHECK_EQ(w.TakeWindow(), 4u);
+
+    // A new session high carries into Max().
+    w.Record(20);
+    CHECK_EQ(w.Max(), 20u);
+    CHECK_EQ(w.TakeWindow(), 20u);
+
+    // Concurrent producers: the max must equal the largest value any thread recorded.
+    tsl::MaxWindow c;
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    for (int th = 0; th < 4; th++) {
+        threads.emplace_back([&c, &go, th] {
+            while (!go.load()) {
+            }
+            for (uint32_t v = 0; v <= 1000; v++) c.Record(v + static_cast<uint32_t>(th) * 1000u);
+        });
+    }
+    go.store(true);
+    for (auto &x : threads) x.join();
+    CHECK_EQ(c.Max(), 4000u);  // thread 3 records up to 3000+1000
+}
 
 int main() {
     tsl::SetLogLevel(IHS_LogLevelWarn);
@@ -984,8 +1402,17 @@ int main() {
     TestFec();
     TestDataChannelGetsPastLostPacket();
     TestRetransmissionCancelRacesTimer();
+    TestFullReportDedup();
+    TestRetransmissionPolicy();
+    TestCancelCumulativeVsExact();
+    TestRetransmitZombieGuard();
+    TestControlBacklogGauge();
+    TestResyncFull();
+    TestHIDBackpressureAndResync();
+    TestControlHardCapDisconnect();
     TestSilenceMs();
     TestWakePacket();
+    TestMaxWindow();
     IHS_Quit();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

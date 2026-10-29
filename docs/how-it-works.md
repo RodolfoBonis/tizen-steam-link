@@ -62,6 +62,10 @@ with a simulated computer.
 | `FEC: ... rebuilt, ... lost` | Messages rebuilt from parity packets, and messages lost anyway. |
 | `keyframe requests` | How often the app asked Steam for a keyframe. |
 | `round trip` | The time from a control message to Steam's confirmation. |
+| `input: full-report requests, retransmits given up` | How often the computer asked for a full controller report to resync, and reliable packets dropped after their last retransmit. Both climbing points at the input freeze. |
+| `control backlog ... (max resends ...), HID skipped ...` | Control messages awaiting confirmation right now, the most times any one was resent this session, and controller reports skipped because the backlog was at its cap (a stalled uplink). A backlog that keeps growing, or HID skipped climbing, points at a bad uplink. |
+| `poll iters ... gap ...  sample ...  pad age ...  chg ...` | The gamepad poll thread over the last second: loop iterations, worst loop gap and worst `emscripten_sample_gamepad_data` call (each `now/peak`, in ms), slot 0's Gamepad API data age (`now/peak`), and distinct pad states forwarded. Iterations dropping to zero, or the gap/sample/age climbing during a freeze, says the poll thread or the browser main thread stalled. |
+| `rAF gap ...  ts age ...  ·  HID poll ... sent ... input on/OFF cfg ...` | The browser main thread's `requestAnimationFrame` gap (`now/peak`, ms) and the first pad's Gamepad API timestamp age; then, from the host side, HID poll ticks and reports sent over the last second, whether the host still has input enabled (`OFF` if it turned it off), and how many client-config messages it sent. `input OFF`, or poll/sent at zero with the pad still moving, says the freeze is on the host/HID side rather than the TV's. |
 | `player: appended, decoded, dropped, time, ready` | What the TV's player did with the frames. |
 | `sessions, closes, append error, pipeline errors` | Problems the TV's player reported. |
 | `audio: ... frames, ... lost ones filled in` | Sound frames passed to the player, and lost ones the decoder filled in. |
@@ -144,3 +148,7 @@ Each patch starts with a description of what it does and why.
 | 0020 | Starts a data channel over after a gap longer than its window, instead of leaving it quiet for good. |
 | 0021 | Lets the app offer HDR10 to Steam, and passes on the colorspace Steam chose for the stream. |
 | 0022 | Fixes a race in the silence check that could end a live stream with "Nothing from the host for 4294967295 ms". |
+| 0023 | Always sends a controller's full report when the computer asks for one, instead of dropping it as a duplicate, so input can't stay frozen on a stale state. |
+| 0024 | Logs and counts the computer's full-report requests, reliable packets dropped after their last retransmit, and the control-message backlog, for the log and the statistics. |
+| 0025 | Stops resending every reliable packet a confirmation covers, not only the one it names, since Steam confirms cumulatively. |
+| 0026 | Resends a control-channel packet until the computer confirms it, instead of giving up after 20 tries, so a brief Wi-Fi stall doesn't freeze the controller. When the backlog is full it stops sending new controller reports before they take a packet number (so a dead uplink can't leave a permanent gap that blocks everything after it), then resyncs with a full report once the backlog drains; only non-controller messages that must arrive, and only if they pile up far past that, disconnect the session. |

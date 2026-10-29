@@ -98,6 +98,15 @@ SessionStats Session::Stats() const {
     s.fec = net.fec;
     s.fecRecovered = net.fecRecovered;
     s.fecUnrecoverable = net.fecUnrecoverable;
+    s.fullReportRequests = net.fullReportRequests;
+    s.retransmitsAbandoned = net.retransmitsAbandoned;
+    s.controlPending = net.controlPending;
+    s.controlMaxRetransmit = net.controlMaxRetransmit;
+    s.hidReportsSkipped = net.hidReportsSkipped;
+    s.hidPollTicks = net.hidPollTicks;
+    s.hidReportsSent = net.hidReportsSent;
+    s.setStreamingClientConfigs = net.setStreamingClientConfigs;
+    s.inputEnabled = net.inputEnabled;
     s.timedOut = net.timedOut;
     s.framerateNum = fpsNum_.load();
     s.framerateDen = fpsDen_.load();
