@@ -5,21 +5,25 @@ Several signs of input trouble left no trace. The host asks for a full HID repor
 Info level. A reliable packet that ran out of retransmissions was dropped with no log at all.
 And the control-channel backlog, which matters once a packet can be resent for a long time
 (see 0026), wasn't visible anywhere. During a controller freeze these happen, so nothing showed
-why.
+why. A freeze can also come from the client side (the poll never ticks, the host turns input
+off), which left no trace either.
 
 RequestFullReport now logs at Info with the device id, and a reliable packet dropped after its
 last retransmit logs at Warn with its channel and packet id; both are rate-limited so a storm
-can't flood the log. Five counters join IHS_SessionStreamStats, read through
+can't flood the log. SetStreamingClientConfig logs at Info (was Debug): the host toggling input
+off is a freeze suspect. Counters join IHS_SessionStreamStats, read through
 IHS_SessionGetStreamStats and shown in the overlay: fullReportRequests and retransmitsAbandoned
-(counters), controlPending and controlMaxRetransmit (gauges), and hidReportsSkipped (a counter),
-all fed by the retransmission and HID changes in 0025 and 0026. They live in the session, so
-they stay readable after the data channels are gone.
+(counters), controlPending and controlMaxRetransmit (gauges), hidReportsSkipped (a counter), and
+the client-side diagnostics hidPollTicks (the ihslib HID timer thread draining devices),
+hidReportsSent (reports actually handed to the control channel), setStreamingClientConfigs, and
+inputEnabled (the live state.streamingInput flag). They live in the session, so they stay
+readable after the data channels are gone.
 
 diff --git a/include/ihslib/session.h b/include/ihslib/session.h
-index d259f66..dacede8 100644
+index d259f66..4f4fe8c 100644
 --- a/include/ihslib/session.h
 +++ b/include/ihslib/session.h
-@@ -241,6 +241,16 @@ typedef struct IHS_SessionStreamStats {
+@@ -241,6 +241,24 @@ typedef struct IHS_SessionStreamStats {
      uint32_t fecUnrecoverable;
      /** The session ended because the host went silent (no packets for 10 s), not by request. */
      bool timedOut;
@@ -33,14 +37,63 @@ index d259f66..dacede8 100644
 +    uint32_t controlMaxRetransmit;
 +    /** HID reports not sent because the control backlog was at its soft cap (a stalled uplink); the host resyncs with a full report once it drains. */
 +    uint32_t hidReportsSkipped;
++    /** HID poll ticks (the ihslib timer thread draining devices); stops climbing if that thread stalls. */
++    uint32_t hidPollTicks;
++    /** HID report messages actually handed to the control channel for sending. */
++    uint32_t hidReportsSent;
++    /** SetStreamingClientConfig messages received from the host (it toggles input/audio/video streaming). */
++    uint32_t setStreamingClientConfigs;
++    /** Whether the host currently has client input streaming enabled (state.streamingInput). */
++    bool inputEnabled;
  } IHS_SessionStreamStats;
  
  void IHS_SessionGetStreamStats(const IHS_Session *session, IHS_SessionStreamStats *stats);
+diff --git a/src/hid/manager.c b/src/hid/manager.c
+index 58de065..31a4e95 100644
+--- a/src/hid/manager.c
++++ b/src/hid/manager.c
+@@ -216,6 +216,9 @@ void IHS_HIDManagerRemoveProvider(IHS_HIDManager *manager, IHS_HIDProvider *prov
+ static uint64_t HIDPollTick(int runCount, void *context) {
+     (void) runCount;
+     IHS_HIDManager *manager = context;
++    // Diagnostics: count every tick, before the input-enabled gate, so the overlay shows whether
++    // the ihslib timer thread is still draining devices at all.
++    IHS_SessionCounterAdd(manager->session->counters.hidPollTicks, 1);
+     // If input streaming is disabled, skip the device drain entirely. Otherwise the holders
+     // would accumulate raw reports that IHS_SessionHIDSendReport refuses to flush, growing
+     // the per-device dataBuffer without bound. The timer keeps ticking so we resume
+diff --git a/src/session/channels/ch_control.c b/src/session/channels/ch_control.c
+index 86a56db..c3172e0 100644
+--- a/src/session/channels/ch_control.c
++++ b/src/session/channels/ch_control.c
+@@ -461,7 +461,10 @@ static void OnSetClientConfig(IHS_SessionChannel *channel, const CSetStreamingCl
+     if (config->has_enable_video_streaming) {
+         session->state.streamingVideo = config->enable_video_streaming;
+     }
+-    IHS_SessionLog(session, IHS_LogLevelDebug, "Control",
++    // Diagnostics: the host toggling input off is a freeze suspect; count these and log at Info
++    // (was Debug) so the toggle is visible in the app log without sdb.
++    IHS_SessionCounterAdd(session->counters.setStreamingClientConfigs, 1);
++    IHS_SessionLog(session, IHS_LogLevelInfo, "Control",
+                    "Set client config. input=%u audio=%u video=%u enable_video_hevc=%u",
+                    session->state.streamingInput, session->state.streamingAudio,
+                    session->state.streamingVideo, config->enable_video_hevc);
 diff --git a/src/session/channels/control/control_hid.c b/src/session/channels/control/control_hid.c
-index 7f2b28e..c9ac028 100644
+index 7f2b28e..4c6db7c 100644
 --- a/src/session/channels/control/control_hid.c
 +++ b/src/session/channels/control/control_hid.c
-@@ -541,6 +541,15 @@ static void HandleDeviceRequestFullReport(IHS_SessionChannel *channel, IHS_HIDMa
+@@ -292,6 +292,10 @@ bool IHS_SessionHIDSendReport(IHS_Session *session) {
+         ret = IHS_SessionChannelControlSend(channel, k_EStreamControlRemoteHID,
+                                             (const ProtobufCMessage *) &wrapped, IHS_PACKET_ID_NEXT);
+         free(packed);
++        // Diagnostics: count reports that were actually handed to the control channel.
++        if (ret) {
++            IHS_SessionCounterAdd(session->counters.hidReportsSent, 1);
++        }
+     }
+     return ret;
+ }
+@@ -541,6 +545,15 @@ static void HandleDeviceRequestFullReport(IHS_SessionChannel *channel, IHS_HIDMa
          return;
      }
  
@@ -85,10 +138,10 @@ index 14a14aa..c137464 100644
      return 0;
  }
 diff --git a/src/session/session.c b/src/session/session.c
-index 427503b..1b5bd0d 100644
+index 427503b..d0f8793 100644
 --- a/src/session/session.c
 +++ b/src/session/session.c
-@@ -214,6 +214,11 @@ void IHS_SessionGetStreamStats(const IHS_Session *session, IHS_SessionStreamStat
+@@ -214,6 +214,15 @@ void IHS_SessionGetStreamStats(const IHS_Session *session, IHS_SessionStreamStat
      stats->fecRecovered = IHS_SessionCounterGet(session->counters.fecRecovered);
      stats->fecUnrecoverable = IHS_SessionCounterGet(session->counters.fecUnrecoverable);
      stats->timedOut = IHS_SessionCounterGet(session->timedOut);
@@ -97,14 +150,18 @@ index 427503b..1b5bd0d 100644
 +    stats->controlPending = IHS_SessionCounterGet(session->counters.controlPending);
 +    stats->controlMaxRetransmit = IHS_SessionCounterGet(session->counters.controlMaxRetransmit);
 +    stats->hidReportsSkipped = IHS_SessionCounterGet(session->counters.hidReportsSkipped);
++    stats->hidPollTicks = IHS_SessionCounterGet(session->counters.hidPollTicks);
++    stats->hidReportsSent = IHS_SessionCounterGet(session->counters.hidReportsSent);
++    stats->setStreamingClientConfigs = IHS_SessionCounterGet(session->counters.setStreamingClientConfigs);
++    stats->inputEnabled = session->state.streamingInput;
  }
  
  static void SessionRecvCallback(IHS_Base *base, const IHS_SocketAddress *address, IHS_Buffer *data) {
 diff --git a/src/session/session_pri.h b/src/session/session_pri.h
-index 9b6d772..8e60edf 100644
+index 9b6d772..f53bab5 100644
 --- a/src/session/session_pri.h
 +++ b/src/session/session_pri.h
-@@ -87,6 +87,14 @@ typedef struct IHS_SessionCounters {
+@@ -87,6 +87,21 @@ typedef struct IHS_SessionCounters {
      uint32_t fecShardsLost;
      uint32_t fecRecovered;
      uint32_t fecUnrecoverable;
@@ -116,6 +173,13 @@ index 9b6d772..8e60edf 100644
 +    uint32_t controlMaxRetransmit;
 +    /* HID reports skipped at generation because the control backlog was at its soft cap. */
 +    uint32_t hidReportsSkipped;
++    /* Diagnostics: times the HID poll timer ticked (the ihslib timer thread draining devices).
++     * Stops climbing if that thread stalls, so the overlay can tell whether input is polled at all. */
++    uint32_t hidPollTicks;
++    /* Diagnostics: HID report messages actually handed to the control channel for sending. */
++    uint32_t hidReportsSent;
++    /* Diagnostics: SetStreamingClientConfig messages received (the host toggling input/audio/video). */
++    uint32_t setStreamingClientConfigs;
  } IHS_SessionCounters;
  
  #define IHS_SessionCounterAdd(field, n) __atomic_fetch_add(&(field), (n), __ATOMIC_RELAXED)

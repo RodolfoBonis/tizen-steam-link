@@ -81,6 +81,13 @@ struct SessionStats {
     uint32_t controlPending = 0;
     uint32_t controlMaxRetransmit = 0;
     uint32_t hidReportsSkipped = 0;
+    // Input diagnostics, from ihslib. HID poll ticks (the ihslib timer thread draining devices;
+    // stops climbing if it stalls), HID report messages actually sent, SetStreamingClientConfig
+    // messages received, and whether the host currently has client input streaming enabled.
+    uint32_t hidPollTicks = 0;
+    uint32_t hidReportsSent = 0;
+    uint32_t setStreamingClientConfigs = 0;
+    bool inputEnabled = true;
     // The session ended because the host went silent, not by request.
     bool timedOut = false;
 };

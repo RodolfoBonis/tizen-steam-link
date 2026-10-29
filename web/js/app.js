@@ -805,6 +805,25 @@
             '\naudio: ' + (st.audioAppended || 0) + ' frames, ' + (st.audioConcealed || 0) + ' lost ones filled in';
     }
 
+    // Where an input freeze is: the gamepad poll thread (iters/gap/sample), Tizen's Gamepad API
+    // (pad age/ts age), the browser main thread (rAF gap), or the host/ihslib HID path (poll/sent/
+    // input/cfg). Each window-and-peak pair reads "now/peak"; counts are per 1 s window.
+    function inputDiag(st, last) {
+        var ms = function (u) { return (u / 1000).toFixed(1); };  // microseconds -> ms
+        var rafWin = padDiag.rafGapWin;
+        padDiag.rafGapWin = 0;
+        return 'poll iters ' + ((st.pollIters || 0) - last.pollIters) +
+            '  gap ' + ms(st.pollGapUs || 0) + '/' + ms(st.pollGapMaxUs || 0) + ' ms' +
+            '  sample ' + ms(st.sampleUs || 0) + '/' + ms(st.sampleMaxUs || 0) + ' ms' +
+            '  pad age ' + (st.padAgeMs || 0) + '/' + (st.padAgeMaxMs || 0) + ' ms' +
+            '  chg ' + ((st.padChanges || 0) - last.padChanges) + '\n' +
+            'rAF gap ' + rafWin.toFixed(0) + '/' + padDiag.rafGapMax.toFixed(0) + ' ms' +
+            '  ts age ' + Math.round(padDiag.padTsAge) + ' ms' +
+            '  ·  HID poll ' + ((st.hidPollTicks || 0) - last.hidPollTicks) +
+            ' sent ' + ((st.hidReportsSent || 0) - last.hidReportsSent) +
+            ' input ' + (st.inputEnabled ? 'on' : 'OFF') + ' cfg ' + (st.setClientConfigs || 0);
+    }
+
     function updateStats() {
         var s = state.stream;
         if (!s || !mod) return;
@@ -826,10 +845,24 @@
                 'target ' + (st.targetBitrate / 1000).toFixed(1) + ' Mbit/s' +  // Steam sends kbit/s
                 (st.framerateDen ? ' @ ' + (st.framerateNum / st.framerateDen).toFixed(0) + ' fps' : '') + '\n' +
                 'keyframes ' + st.keyFrames + '   failed appends ' + (st.videoFailed + st.audioFailed) + '\n' +
-                networkStats(st, s.last) + '\n' + playerStats(st);
+                networkStats(st, s.last) + '\n' + inputDiag(st, s.last) + '\n' + playerStats(st);
+        }
+        // Log when the host turns client input off or back on, with how long the last state held.
+        if (st) {
+            if (s.inputState === undefined) {
+                s.inputState = !!st.inputEnabled;
+                s.inputSince = now;
+            } else if (!!st.inputEnabled !== s.inputState) {
+                note('info [Pad] host input ' + (st.inputEnabled ? 'ENABLED' : 'DISABLED') +
+                    ' after ' + ((now - s.inputSince) / 1000).toFixed(1) + ' s');
+                s.inputState = !!st.inputEnabled;
+                s.inputSince = now;
+            }
         }
         s.last = {time: now, videoFrames: st.videoFrames, videoBytes: st.videoBytes,
-            videoPackets: st.videoPackets || 0, videoPacketsLost: st.videoPacketsLost || 0};
+            videoPackets: st.videoPackets || 0, videoPacketsLost: st.videoPacketsLost || 0,
+            pollIters: st.pollIters || 0, padChanges: st.padChanges || 0,
+            hidPollTicks: st.hidPollTicks || 0, hidReportsSent: st.hidReportsSent || 0};
         $('#stream-stats').textContent = text;
     }
 
@@ -1078,6 +1111,9 @@
     var padPrev = {};
     var padRepeat = {};
     var padSeen = {};
+    // Input-freeze diagnostics for the stats overlay: the gap between requestAnimationFrame
+    // callbacks (the browser main thread's health) and the first pad's Gamepad API timestamp age.
+    var padDiag = {lastRaf: 0, rafGapWin: 0, rafGapMax: 0, padTsAge: 0, lastRafLog: 0};
 
     // A short buzz when a controller first shows up, so it's clear the TV has it.
     function hello(pad) {
@@ -1089,12 +1125,28 @@
     }
 
     function pollPads(ts) {
-        var anyPad = false;
+        // The gap since the last callback: on a healthy TV this is one frame (~16 ms); a long gap
+        // means the browser main thread stalled, which also stalls the WASM gamepad polling.
+        if (padDiag.lastRaf) {
+            var rafGap = ts - padDiag.lastRaf;
+            if (rafGap > padDiag.rafGapWin) padDiag.rafGapWin = rafGap;
+            if (rafGap > padDiag.rafGapMax) padDiag.rafGapMax = rafGap;
+            if (rafGap > 300 && ts - padDiag.lastRafLog > 2000) {
+                padDiag.lastRafLog = ts;
+                note('info [Pad] rAF gap ' + Math.round(rafGap) + ' ms');
+            }
+        }
+        padDiag.lastRaf = ts;
+        var anyPad = false, gotAge = false;
         if (navigator.getGamepads) {
             var all = navigator.getGamepads();
             for (var j = 0; j < all.length; j++) {
                 if (all[j] && all[j].connected) {
                     anyPad = true;
+                    if (!gotAge) {
+                        gotAge = true;
+                        padDiag.padTsAge = Math.max(0, ts - all[j].timestamp);
+                    }
                     if (!padSeen[all[j].index]) {
                         padSeen[all[j].index] = true;
                         hello(all[j]);
@@ -1104,6 +1156,7 @@
                 }
             }
         }
+        if (!gotAge) padDiag.padTsAge = 0;
         if (anyPad !== state.padConnected) {
             state.padConnected = anyPad;
             $('#pad-indicator').hidden = !anyPad;

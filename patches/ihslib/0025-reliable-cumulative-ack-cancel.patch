@@ -183,7 +183,7 @@ index f3a341b..d99a2a3 100644
 -                              uint16_t packetId, uint16_t fragmentId);
 +                              uint16_t packetId, uint16_t fragmentId, bool cumulative);
 diff --git a/src/session/session.c b/src/session/session.c
-index db7aa99..4f36b1e 100644
+index d0f8793..c9ebc3b 100644
 --- a/src/session/session.c
 +++ b/src/session/session.c
 @@ -187,8 +187,8 @@ bool IHS_SessionSendControlMessage(IHS_Session *session, EStreamControlMessage t
@@ -197,7 +197,7 @@ index db7aa99..4f36b1e 100644
  }
  
  void IHS_SessionHIDAddProvider(IHS_Session *session, IHS_HIDProvider *provider) {
-@@ -235,8 +235,11 @@ static void SessionRecvCallback(IHS_Base *base, const IHS_SocketAddress *address
+@@ -239,8 +239,11 @@ static void SessionRecvCallback(IHS_Base *base, const IHS_SocketAddress *address
      IHS_SessionChannelId channelId = packet.header.channelId;
      IHS_SessionPacketType packetType = packet.header.type;
      if (packetType == IHS_SessionPacketTypeACK || packetType == IHS_SessionPacketTypeNACK) {
@@ -212,10 +212,10 @@ index db7aa99..4f36b1e 100644
      IHS_SessionChannel *channel = IHS_SessionChannelFor(session, channelId);
      if (channel != NULL) {
 diff --git a/src/session/session_pri.h b/src/session/session_pri.h
-index 152e177..a67cc6d 100644
+index f53bab5..68545f6 100644
 --- a/src/session/session_pri.h
 +++ b/src/session/session_pri.h
-@@ -166,4 +166,4 @@ bool IHS_SessionSendControlMessage(IHS_Session *session, EStreamControlMessage t
+@@ -173,4 +173,4 @@ bool IHS_SessionSendControlMessage(IHS_Session *session, EStreamControlMessage t
  bool IHS_SessionInputEnabled(IHS_Session *session);
  
  bool IHS_SessionCancelRetransmission(IHS_Session *session, IHS_SessionChannelId channelId, uint16_t packetId,

@@ -25,6 +25,7 @@
 #include <thread>
 
 #include "core/client.h"
+#include "core/diag.h"
 #include "core/gamepad.h"
 #include "core/identity.h"
 #include "core/keymap.h"
@@ -303,7 +304,18 @@ public:
                ",\"lastCloseReason\":" + std::to_string(c.lastCloseReason) + ",\"lastAppendError\":" +
                std::to_string(c.lastAppendError) + ",\"pipelineErrors\":" + std::to_string(c.pipelineErrors) +
                ",\"lastPipelineError\":" + std::to_string(c.lastPipelineError) + ",\"audioConcealed\":" +
-               std::to_string(c.audioConcealed) + "}";
+               std::to_string(c.audioConcealed) +
+               // Input diagnostics (ihslib-sourced and gamepad poll-thread; see web/js/app.js).
+               ",\"hidPollTicks\":" + std::to_string(s.hidPollTicks) + ",\"hidReportsSent\":" +
+               std::to_string(s.hidReportsSent) + ",\"setClientConfigs\":" +
+               std::to_string(s.setStreamingClientConfigs) + ",\"inputEnabled\":" +
+               (s.inputEnabled ? "true" : "false") + ",\"pollIters\":" +
+               std::to_string(pollIterations_.load()) + ",\"pollGapUs\":" +
+               std::to_string(pollGapUs_.TakeWindow()) + ",\"pollGapMaxUs\":" +
+               std::to_string(pollGapUs_.Max()) + ",\"sampleUs\":" + std::to_string(sampleUs_.TakeWindow()) +
+               ",\"sampleMaxUs\":" + std::to_string(sampleUs_.Max()) + ",\"padAgeMs\":" +
+               std::to_string(padAgeMs_.load()) + ",\"padAgeMaxMs\":" + std::to_string(padAgeMaxMs_.load()) +
+               ",\"padChanges\":" + std::to_string(padChanges_.load()) + "}";
     }
 
     // Client::Listener (ihslib client thread)
@@ -485,23 +497,60 @@ private:
         // After the menu, a pad stays released for the computer until every button and trigger
         // is let go: the press that closed the menu isn't the computer's.
         bool padHeld[TSL_GAMEPAD_SLOTS] = {};
+        // Last state fed to each slot, to count distinct changes (diagnostics only).
+        TSL_GamepadState lastFed[TSL_GAMEPAD_SLOTS] = {};
         const Session *lastSession = nullptr;
+        double lastIterMs = 0;        // emscripten_get_now() of the previous streaming iteration
+        double lastGapLogMs = 0;      // rate-limits the poll-gap Info log
+        double lastSampleLogMs = 0;   // rate-limits the sample-call Info log
         while (polling_) {
             std::shared_ptr<Session> session = streaming_ ? CurrentSession() : nullptr;
             if (!session) {
                 exitSent = false;
+                lastIterMs = 0;  // idle sleeps below are not a poll-loop stall
                 usleep(50 * 1000);
                 continue;
             }
+            // Gap since the previous streaming iteration: a stall here (a blocked browser main
+            // thread stops the proxied Gamepad API calls) is a freeze suspect.
+            double nowMs = emscripten_get_now();
+            if (lastIterMs != 0) {
+                double gapMs = nowMs - lastIterMs;
+                pollGapUs_.Record(static_cast<uint32_t>(gapMs * 1000.0));
+                if (gapMs > 300.0 && nowMs - lastGapLogMs > 2000.0) {
+                    lastGapLogMs = nowMs;
+                    Log(IHS_LogLevelInfo, "Pad", "Gamepad poll stalled %.0f ms", gapMs);
+                }
+            }
+            lastIterMs = nowMs;
+            pollIterations_.fetch_add(1, std::memory_order_relaxed);
             if (session.get() != lastSession) {
                 // A new session knows no pads yet; announce every connected one again.
                 lastSession = session.get();
                 for (bool &c : padConnected) c = false;
             }
-            if (emscripten_sample_gamepad_data() != EMSCRIPTEN_RESULT_SUCCESS) {
+            // emscripten_sample_gamepad_data is proxied to the browser main thread; time it, since
+            // a long call means that thread (not this one) is where input is being held up.
+            double sampleStartMs = emscripten_get_now();
+            EMSCRIPTEN_RESULT sampled = emscripten_sample_gamepad_data();
+            double sampleMs = emscripten_get_now() - sampleStartMs;
+            sampleUs_.Record(static_cast<uint32_t>(sampleMs * 1000.0));
+            if (sampleMs > 100.0 && nowMs - lastSampleLogMs > 2000.0) {
+                lastSampleLogMs = nowMs;
+                Log(IHS_LogLevelInfo, "Pad", "Gamepad sample took %.0f ms", sampleMs);
+            }
+            if (sampled != EMSCRIPTEN_RESULT_SUCCESS) {
                 usleep(200 * 1000);
                 continue;
             }
+            // Count a change and forward the state; keeps the three feed paths below in one place.
+            auto feed = [&](int slot, const TSL_GamepadState &st) {
+                if (std::memcmp(&lastFed[slot], &st, sizeof st) != 0) {
+                    padChanges_.fetch_add(1, std::memory_order_relaxed);
+                    lastFed[slot] = st;
+                }
+                session->UpdateGamepad(slot, st);
+            };
             int count = emscripten_get_num_gamepads();
             for (int i = 0; i < TSL_GAMEPAD_SLOTS; i++) {
                 EmscriptenGamepadEvent pad;
@@ -520,7 +569,19 @@ private:
                     PostEvent(connected ? "gamepadConnected" : "gamepadDisconnected",
                               "{\"slot\":" + std::to_string(i) + ",\"id\":" + Quote(connected ? pad.id : "") + "}");
                 }
-                if (!connected) continue;
+                if (!connected) {
+                    // Slot 0's pad data age is only meaningful while a pad is there.
+                    if (i == 0) padAgeMs_.store(0, std::memory_order_relaxed);
+                    continue;
+                }
+                if (i == 0) {
+                    // Age of the Gamepad API's timestamp for slot 0: if Tizen stops updating the
+                    // pad's Bluetooth data, this climbs even while buttons are pressed.
+                    double ageMs = nowMs - pad.timestamp;
+                    uint32_t age = ageMs > 0 ? static_cast<uint32_t>(ageMs) : 0;
+                    padAgeMs_.store(age, std::memory_order_relaxed);
+                    AtomicMax(padAgeMaxMs_, age);
+                }
                 bool pressed[64];
                 int buttons = pad.numButtons < 64 ? pad.numButtons : 64;
                 for (int b = 0; b < buttons; b++) pressed[b] = pad.digitalButton[b] != 0;
@@ -529,20 +590,20 @@ private:
                                              static_cast<size_t>(buttons), &state);
                 if (!padInput_) {
                     padHeld[i] = true;
-                    session->UpdateGamepad(i, TSL_GamepadState{});
+                    feed(i, TSL_GamepadState{});
                     continue;
                 }
                 if (padHeld[i]) {
                     const int16_t triggerUp = 4096;
                     if (state.buttons != 0 || state.axes[TSL_PAD_AXIS_TRIGGER_LEFT] > triggerUp ||
                         state.axes[TSL_PAD_AXIS_TRIGGER_RIGHT] > triggerUp) {
-                        session->UpdateGamepad(i, TSL_GamepadState{});
+                        feed(i, TSL_GamepadState{});
                         continue;
                     }
                     padHeld[i] = false;
                     exitSent = false;
                 }
-                session->UpdateGamepad(i, state);
+                feed(i, state);
                 if ((state.buttons & exitCombo) == exitCombo && !exitSent) {
                     exitSent = true;
                     PostEvent("exitCombo", "{}");
@@ -574,6 +635,17 @@ private:
     std::atomic<bool> streaming_{false};
     std::atomic<bool> padInput_{true};
     std::thread gamepadThread_;
+
+    // Gamepad poll-thread diagnostics: written by the poll thread, read by Stats() on the browser
+    // main thread once per stats window. Times are microseconds except pad age (milliseconds).
+    // The window metrics reset when Stats() reads them; the counts are monotonic and the UI shows
+    // their per-window delta. No locks: the poll path must never block.
+    std::atomic<uint64_t> pollIterations_{0};  // streaming poll iterations
+    std::atomic<uint64_t> padChanges_{0};      // distinct states fed to Session::UpdateGamepad
+    MaxWindow pollGapUs_;                       // gap between poll iterations
+    MaxWindow sampleUs_;                        // duration of emscripten_sample_gamepad_data
+    std::atomic<uint32_t> padAgeMs_{0};         // slot 0: ms since the Gamepad API timestamp
+    std::atomic<uint32_t> padAgeMaxMs_{0};      // session peak of the above
 };
 
 App *g_app = nullptr;

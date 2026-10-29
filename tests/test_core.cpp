@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "core/client.h"
+#include "core/diag.h"
 #include "core/gamepad.h"
 #include "core/identity.h"
 #include "core/keymap.h"
@@ -1336,6 +1337,50 @@ void TestControlHardCapDisconnect() {
 
 }  // namespace
 
+static void TestMaxWindow() {
+    tsl::MaxWindow w;
+    // Empty: both the window and the session peak are zero.
+    CHECK_EQ(w.Window(), 0u);
+    CHECK_EQ(w.Max(), 0u);
+
+    w.Record(5);
+    w.Record(3);  // smaller: ignored by both
+    w.Record(8);
+    CHECK_EQ(w.Window(), 8u);
+    CHECK_EQ(w.Max(), 8u);
+
+    // TakeWindow returns the window's peak and resets the window, but not the session peak.
+    CHECK_EQ(w.TakeWindow(), 8u);
+    CHECK_EQ(w.Window(), 0u);
+    CHECK_EQ(w.Max(), 8u);
+
+    // A quieter window: its own peak, while the session peak stays at the earlier high.
+    w.Record(4);
+    CHECK_EQ(w.Window(), 4u);
+    CHECK_EQ(w.Max(), 8u);
+    CHECK_EQ(w.TakeWindow(), 4u);
+
+    // A new session high carries into Max().
+    w.Record(20);
+    CHECK_EQ(w.Max(), 20u);
+    CHECK_EQ(w.TakeWindow(), 20u);
+
+    // Concurrent producers: the max must equal the largest value any thread recorded.
+    tsl::MaxWindow c;
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    for (int th = 0; th < 4; th++) {
+        threads.emplace_back([&c, &go, th] {
+            while (!go.load()) {
+            }
+            for (uint32_t v = 0; v <= 1000; v++) c.Record(v + static_cast<uint32_t>(th) * 1000u);
+        });
+    }
+    go.store(true);
+    for (auto &x : threads) x.join();
+    CHECK_EQ(c.Max(), 4000u);  // thread 3 records up to 3000+1000
+}
+
 int main() {
     tsl::SetLogLevel(IHS_LogLevelWarn);
     IHS_Init();
@@ -1367,6 +1412,7 @@ int main() {
     TestControlHardCapDisconnect();
     TestSilenceMs();
     TestWakePacket();
+    TestMaxWindow();
     IHS_Quit();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

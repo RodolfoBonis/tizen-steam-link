@@ -83,7 +83,7 @@ index 97ec564..97a2ae8 100644
                                   size_t len);
  
 diff --git a/src/session/channels/control/control_hid.c b/src/session/channels/control/control_hid.c
-index c9ac028..7c2b24f 100644
+index 4c6db7c..c64a8d1 100644
 --- a/src/session/channels/control/control_hid.c
 +++ b/src/session/channels/control/control_hid.c
 @@ -226,6 +226,38 @@ bool IHS_SessionHIDSendReport(IHS_Session *session) {
@@ -387,7 +387,7 @@ index d99a2a3..cc95259 100644
  
  void IHS_RetransmissionDeinit(IHS_SessionRetransmission *retransmission);
 diff --git a/src/session/session_pri.h b/src/session/session_pri.h
-index 0b61126..99e083b 100644
+index 68545f6..960eba4 100644
 --- a/src/session/session_pri.h
 +++ b/src/session/session_pri.h
 @@ -95,6 +95,9 @@ typedef struct IHS_SessionCounters {
@@ -397,6 +397,6 @@ index 0b61126..99e083b 100644
 +    /* Latch: set when a HID report is skipped at the soft cap, cleared when a later batch (once the
 +     * backlog drains below the watermark) is sent as full reports, so the host resyncs on recovery. */
 +    uint32_t hidResyncNeeded;
- } IHS_SessionCounters;
- 
- #define IHS_SessionCounterAdd(field, n) __atomic_fetch_add(&(field), (n), __ATOMIC_RELAXED)
+     /* Diagnostics: times the HID poll timer ticked (the ihslib timer thread draining devices).
+      * Stops climbing if that thread stalls, so the overlay can tell whether input is polled at all. */
+     uint32_t hidPollTicks;

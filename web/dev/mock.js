@@ -117,7 +117,10 @@
                 audioFailed: 0, silenceFilled: 0, videoPackets: frames * 18, videoPacketsLost: Math.floor(frames / 40),
                 lostReports: 1, roundTripMs: 3.4, fec: true, fecRecovered: Math.floor(frames / 45),
                 fecUnrecoverable: 1, fullReportRequests: Math.floor(frames / 200), retransmitsAbandoned: 0,
-                controlPending: 2, controlMaxRetransmit: 3, hidReportsSkipped: 0});
+                controlPending: 2, controlMaxRetransmit: 3, hidReportsSkipped: 0,
+                hidPollTicks: frames * 4, hidReportsSent: frames * 3, setClientConfigs: 1, inputEnabled: true,
+                pollIters: frames * 250, pollGapUs: 4200, pollGapMaxUs: 9800, sampleUs: 1500, sampleMaxUs: 42000,
+                padAgeMs: 12, padAgeMaxMs: 180, padChanges: frames * 5});
         },
         setLogLevel: function () {},
     });
