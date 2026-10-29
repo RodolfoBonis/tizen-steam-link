@@ -102,7 +102,7 @@ SessionStats Session::Stats() const {
     s.retransmitsAbandoned = net.retransmitsAbandoned;
     s.controlPending = net.controlPending;
     s.controlMaxRetransmit = net.controlMaxRetransmit;
-    s.hidBacklogDropped = net.hidBacklogDropped;
+    s.hidReportsSkipped = net.hidReportsSkipped;
     s.timedOut = net.timedOut;
     s.framerateNum = fpsNum_.load();
     s.framerateDen = fpsDen_.load();

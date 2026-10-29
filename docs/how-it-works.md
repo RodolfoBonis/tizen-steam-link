@@ -63,7 +63,7 @@ with a simulated computer.
 | `keyframe requests` | How often the app asked Steam for a keyframe. |
 | `round trip` | The time from a control message to Steam's confirmation. |
 | `input: full-report requests, retransmits given up` | How often the computer asked for a full controller report to resync, and reliable packets dropped after their last retransmit. Both climbing points at the input freeze. |
-| `control backlog ... (max resends ...), HID dropped ...` | Control messages awaiting confirmation right now, the most times any one was resent this session, and controller reports dropped because the backlog hit its cap (a stalled uplink). A backlog that keeps growing, or HID dropped climbing, points at a bad uplink. |
+| `control backlog ... (max resends ...), HID skipped ...` | Control messages awaiting confirmation right now, the most times any one was resent this session, and controller reports skipped because the backlog was at its cap (a stalled uplink). A backlog that keeps growing, or HID skipped climbing, points at a bad uplink. |
 | `player: appended, decoded, dropped, time, ready` | What the TV's player did with the frames. |
 | `sessions, closes, append error, pipeline errors` | Problems the TV's player reported. |
 | `audio: ... frames, ... lost ones filled in` | Sound frames passed to the player, and lost ones the decoder filled in. |
@@ -149,4 +149,4 @@ Each patch starts with a description of what it does and why.
 | 0023 | Always sends a controller's full report when the computer asks for one, instead of dropping it as a duplicate, so input can't stay frozen on a stale state. |
 | 0024 | Logs and counts the computer's full-report requests, reliable packets dropped after their last retransmit, and the control-message backlog, for the log and the statistics. |
 | 0025 | Stops resending every reliable packet a confirmation covers, not only the one it names, since Steam confirms cumulatively. |
-| 0026 | Resends a control-channel packet until the computer confirms it, instead of giving up after 20 tries, so a brief Wi-Fi stall doesn't freeze the controller. Caps the backlog so a dead uplink can't grow it without bound, dropping stale controller reports (the computer resyncs with a full report) and disconnecting only if messages that must arrive pile up. |
+| 0026 | Resends a control-channel packet until the computer confirms it, instead of giving up after 20 tries, so a brief Wi-Fi stall doesn't freeze the controller. When the backlog is full it stops sending new controller reports before they take a packet number (so a dead uplink can't leave a permanent gap that blocks everything after it), then resyncs with a full report once the backlog drains; only non-controller messages that must arrive, and only if they pile up far past that, disconnect the session. |

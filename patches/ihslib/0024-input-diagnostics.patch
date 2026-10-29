@@ -10,13 +10,13 @@ why.
 RequestFullReport now logs at Info with the device id, and a reliable packet dropped after its
 last retransmit logs at Warn with its channel and packet id; both are rate-limited so a storm
 can't flood the log. Five counters join IHS_SessionStreamStats, read through
-IHS_SessionGetStreamStats and shown in the overlay: fullReportRequests and
-retransmitsAbandoned (counters), and controlPending, controlMaxRetransmit and hidBacklogDropped
-(gauges fed by the retransmission changes in 0025 and 0026). They live in the session, so they
-stay readable after the data channels are gone.
+IHS_SessionGetStreamStats and shown in the overlay: fullReportRequests and retransmitsAbandoned
+(counters), controlPending and controlMaxRetransmit (gauges), and hidReportsSkipped (a counter),
+all fed by the retransmission and HID changes in 0025 and 0026. They live in the session, so
+they stay readable after the data channels are gone.
 
 diff --git a/include/ihslib/session.h b/include/ihslib/session.h
-index d259f66..a814db3 100644
+index d259f66..dacede8 100644
 --- a/include/ihslib/session.h
 +++ b/include/ihslib/session.h
 @@ -241,6 +241,16 @@ typedef struct IHS_SessionStreamStats {
@@ -31,8 +31,8 @@ index d259f66..a814db3 100644
 +    uint32_t controlPending;
 +    /** The most times any one control packet has been retransmitted this session. */
 +    uint32_t controlMaxRetransmit;
-+    /** HID reports dropped because the control-channel backlog hit its cap (a dead uplink). */
-+    uint32_t hidBacklogDropped;
++    /** HID reports not sent because the control backlog was at its soft cap (a stalled uplink); the host resyncs with a full report once it drains. */
++    uint32_t hidReportsSkipped;
  } IHS_SessionStreamStats;
  
  void IHS_SessionGetStreamStats(const IHS_Session *session, IHS_SessionStreamStats *stats);
@@ -85,7 +85,7 @@ index 14a14aa..c137464 100644
      return 0;
  }
 diff --git a/src/session/session.c b/src/session/session.c
-index 427503b..db7aa99 100644
+index 427503b..1b5bd0d 100644
 --- a/src/session/session.c
 +++ b/src/session/session.c
 @@ -214,6 +214,11 @@ void IHS_SessionGetStreamStats(const IHS_Session *session, IHS_SessionStreamStat
@@ -96,12 +96,12 @@ index 427503b..db7aa99 100644
 +    stats->retransmitsAbandoned = IHS_SessionCounterGet(session->counters.retransmitsAbandoned);
 +    stats->controlPending = IHS_SessionCounterGet(session->counters.controlPending);
 +    stats->controlMaxRetransmit = IHS_SessionCounterGet(session->counters.controlMaxRetransmit);
-+    stats->hidBacklogDropped = IHS_SessionCounterGet(session->counters.hidBacklogDropped);
++    stats->hidReportsSkipped = IHS_SessionCounterGet(session->counters.hidReportsSkipped);
  }
  
  static void SessionRecvCallback(IHS_Base *base, const IHS_SocketAddress *address, IHS_Buffer *data) {
 diff --git a/src/session/session_pri.h b/src/session/session_pri.h
-index 9b6d772..152e177 100644
+index 9b6d772..8e60edf 100644
 --- a/src/session/session_pri.h
 +++ b/src/session/session_pri.h
 @@ -87,6 +87,14 @@ typedef struct IHS_SessionCounters {
@@ -114,8 +114,8 @@ index 9b6d772..152e177 100644
 +    uint32_t controlPending;
 +    /* High-water mark of any control packet's retransmitCount this session. */
 +    uint32_t controlMaxRetransmit;
-+    /* HID reports dropped because the control backlog hit its cap. */
-+    uint32_t hidBacklogDropped;
++    /* HID reports skipped at generation because the control backlog was at its soft cap. */
++    uint32_t hidReportsSkipped;
  } IHS_SessionCounters;
  
  #define IHS_SessionCounterAdd(field, n) __atomic_fetch_add(&(field), (n), __ATOMIC_RELAXED)

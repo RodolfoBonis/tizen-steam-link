@@ -37,6 +37,7 @@ extern "C" {
 #include "session/channels/ch_data_audio.h"
 #include "session/fec.h"
 #include "session/retransmission.h"
+#include "session/channels/channel.h"
 #include "session/session_pri.h"
 #include "session/window.h"
 }
@@ -1039,16 +1040,22 @@ void TestRetransmissionPolicy() {
     CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdStats, 1), 10u);
     CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdStats, 7), 10u);
 
-    // Backlog cap: only control is capped; a HID report is dropped, anything else disconnects.
-    uint32_t cap = IHS_RETRANSMISSION_CONTROL_PENDING_CAP;
-    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, cap - 1, true),
+    // Backlog hard cap: only the control channel is capped, and since a queued packet already owns
+    // a packet id the only options are to queue it or disconnect (HID is throttled earlier, at
+    // generation, so it never reaches here). Non-control channels are never capped.
+    uint32_t hard = IHS_RETRANSMISSION_CONTROL_HARD_CAP;
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, hard - 1),
              IHS_RetransmissionActionQueue);
-    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, cap, true),
-             IHS_RetransmissionActionDropHid);
-    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, cap, false),
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, hard),
              IHS_RetransmissionActionDisconnect);
-    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdStats, cap + 1000, false),
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdStats, hard + 1000),
              IHS_RetransmissionActionQueue);
+
+    // The thresholds are ordered watermark < soft cap < hard cap, and the hard cap stays under the
+    // 32768 the cumulative-ACK wraparound compare relies on.
+    CHECK(IHS_RETRANSMISSION_CONTROL_RESYNC_WATERMARK < IHS_RETRANSMISSION_CONTROL_SOFT_CAP);
+    CHECK(IHS_RETRANSMISSION_CONTROL_SOFT_CAP < IHS_RETRANSMISSION_CONTROL_HARD_CAP);
+    CHECK(IHS_RETRANSMISSION_CONTROL_HARD_CAP < 32768);
 }
 
 // Makes a session that sends nothing (not connected), so a retransmit stays in the send queue.
@@ -1073,13 +1080,12 @@ IHS_Session *MakeLoopbackSession(uint8_t seed) {
 // Queues a reliable packet on a channel with a given starting retransmitCount. Returns whether it
 // was queued (false if dropped as already-acked, over the cap, or past a channel's attempts).
 bool QueueReliable(IHS_SessionRetransmission *retransmission, IHS_SessionChannelId channelId, uint16_t packetId,
-                   uint8_t retransmitCount = 0, bool droppable = false) {
+                   uint8_t retransmitCount = 0) {
     IHS_SessionPacket packet{};
     packet.header.type = IHS_SessionPacketTypeReliable;
     packet.header.channelId = channelId;
     packet.header.packetId = packetId;
     packet.header.retransmitCount = retransmitCount;
-    packet.header.droppable = droppable;
     packet.header.sendTimestamp = IHS_SessionPacketTimestamp();
     IHS_SessionPacketBodyInitialize(&packet.body, false);
     const uint8_t payload[1] = {0};
@@ -1185,6 +1191,149 @@ void TestControlBacklogGauge() {
     IHS_SessionDestroy(session);
 }
 
+
+// IHS_HIDReportHolderResyncFull rebuilds a full report from the holder's own last state, dropping
+// anything queued this batch. This is how a resync recovers after control backpressure skipped
+// reports, without touching the device (which a concurrent DeviceClose may be freeing).
+void TestResyncFull() {
+    IHS_HIDReportHolder holder;
+    IHS_HIDReportHolderInit(&holder, 2);
+    IHS_HIDReportHolderSetReportLength(&holder, 48);
+    uint8_t a[48] = {0};
+    a[0] = 0xAA;
+    uint8_t b[48] = {0};
+    b[0] = 0xBB;
+
+    // Nothing sent yet: resync has no baseline to resend, so it is a no-op.
+    IHS_HIDReportHolderResyncFull(&holder);
+    CHECK(IHS_HIDReportHolderGetMessage(&holder) == nullptr);
+
+    // Send a full report of A and flush it, so A becomes the last known state.
+    IHS_HIDReportHolderAddFull(&holder, a, 48);
+    IHS_HIDReportHolderResetMessage(&holder);
+
+    // Resync with nothing queued this batch: re-emits a single full report of A.
+    IHS_HIDReportHolderResyncFull(&holder);
+    IHS_HIDDeviceReportMessage *msg = IHS_HIDReportHolderGetMessage(&holder);
+    CHECK(msg != nullptr);
+    if (msg != nullptr) {
+        CHECK_EQ(msg->n_reports, 1u);
+        CHECK(msg->reports[0]->has_full_report);
+        CHECK_EQ(msg->reports[0]->full_report.data[0], 0xAA);
+    }
+    IHS_HIDReportHolderResetMessage(&holder);
+
+    // A delta to B queued this batch, then resync: the delta is dropped and replaced by a single
+    // full report of the most recent state, B (the host ends at B either way, but the full report
+    // doesn't depend on the host already holding A).
+    IHS_HIDReportHolderAddDelta(&holder, a, b, 48);
+    IHS_HIDReportHolderResyncFull(&holder);
+    msg = IHS_HIDReportHolderGetMessage(&holder);
+    CHECK(msg != nullptr);
+    if (msg != nullptr) {
+        CHECK_EQ(msg->n_reports, 1u);
+        CHECK(msg->reports[0]->has_full_report);
+        CHECK_EQ(msg->reports[0]->full_report.data[0], 0xBB);
+    }
+    IHS_HIDReportHolderResetMessage(&holder);
+    IHS_HIDReportHolderDeinit(&holder);
+}
+
+// Generation-time backpressure through production code (IHS_SessionHIDSendReport): at the soft cap
+// a report is skipped before it consumes a packet id, a resync latches, and once the backlog drains
+// below the watermark the next report resyncs with a full report. The gamepad slot is left neutral
+// the whole time, so the 250 Hz poll task never calls SendReport behind our back and the test stays
+// deterministic. The backlog level is set on the gauge the generation path actually reads; the
+// gauge's own queue/drain accounting is covered by TestControlBacklogGauge.
+void TestHIDBackpressureAndResync() {
+    IHS_Session *session = MakeLoopbackSession(11);
+    IHS_HIDProvider *provider = TSL_GamepadProviderCreate();
+    IHS_SessionHIDAddProvider(session, provider);
+    TSL_GamepadInfo info{};
+    info.vendorId = 0x045e;
+    info.productId = 0x02ea;
+    std::snprintf(info.name, sizeof(info.name), "Xbox Wireless Controller");
+    CHECK(TSL_GamepadProviderSetConnected(provider, 1, true, &info));
+    IHS_HIDManagedDevice *managed = IHS_HIDManagerOpenDevice(session->hidManager, "tsl://1");
+    CHECK(managed != nullptr);
+    if (managed == nullptr) {
+        IHS_SessionDestroy(session);
+        TSL_GamepadProviderDestroy(provider);
+        return;
+    }
+
+    // Give the device a baseline state, then flush it to lastSent without sending it (so no
+    // retransmission timers run and the backlog stays whatever we set it to).
+    IHS_HIDReportHolderSetReportLength(&managed->reportHolder, TSL_GAMEPAD_REPORT_SIZE);
+    CHECK_EQ(IHS_HIDDeviceStartInputReports(managed->device, TSL_GAMEPAD_REPORT_SIZE), 0);
+    IHS_MutexLock(managed->lock);
+    IHS_HIDReportHolderResetMessage(&managed->reportHolder);
+    IHS_MutexUnlock(managed->lock);
+
+    IHS_SessionChannel *control = IHS_SessionChannelFor(session, IHS_SessionChannelIdControl);
+    uint16_t idBefore = control->nextPacketId;
+
+    // 1) Backlog at the soft cap: skip before an id is consumed; count the skip and latch a resync.
+    IHS_SessionCounterSet(session->counters.controlPending, IHS_RETRANSMISSION_CONTROL_SOFT_CAP);
+    CHECK(!IHS_SessionHIDSendReport(session));
+    CHECK_EQ(control->nextPacketId, idBefore);
+    CHECK(IHS_SessionCounterGet(session->counters.hidReportsSkipped) >= 1u);
+    CHECK_EQ(IHS_SessionCounterGet(session->counters.hidResyncNeeded), 1u);
+
+    // 2) Between the watermark and the soft cap: no skip, but no resync either - the latch holds
+    //    (hysteresis), and nothing is sent because the holder is empty.
+    IHS_SessionCounterSet(session->counters.controlPending, IHS_RETRANSMISSION_CONTROL_RESYNC_WATERMARK + 1);
+    CHECK(!IHS_SessionHIDSendReport(session));
+    CHECK_EQ(control->nextPacketId, idBefore);
+    CHECK_EQ(IHS_SessionCounterGet(session->counters.hidResyncNeeded), 1u);
+
+    // 3) Drained below the watermark: the next report resyncs - it emits a full report rebuilt from
+    //    the holder even though the device produced nothing new, consuming exactly one id and
+    //    clearing the latch.
+    IHS_SessionCounterSet(session->counters.controlPending, 0);
+    CHECK(IHS_SessionHIDSendReport(session));
+    CHECK_EQ((uint16_t) (control->nextPacketId - idBefore), 1u);
+    CHECK_EQ(IHS_SessionCounterGet(session->counters.hidResyncNeeded), 0u);
+
+    // Close the device while the channels are still alive (as Steam's DeviceClose would), so the
+    // manager's close notification doesn't run against freed channels during IHS_SessionDestroy.
+    IHS_HIDManagerCloseAll(session->hidManager);
+    IHS_SessionDestroy(session);
+    TSL_GamepadProviderDestroy(provider);
+}
+
+// Non-HID control traffic is never throttled, so it can back up behind a dead uplink. At the hard
+// cap IHS_RetransmissionQueue refuses the packet (rather than drop it and gap the ordered channel)
+// and disconnects the session. Below the cap the same queue succeeds.
+void TestControlHardCapDisconnect() {
+    IHS_Session *session = MakeLoopbackSession(12);
+    IHS_SessionRetransmission *r = &session->retransmission;
+    const IHS_SessionChannelId control = IHS_SessionChannelIdControl;
+
+    // Simulate a backlog already at the hard cap. No provider or timers run on this session, so the
+    // pending count stays put; the queue/drain accounting is covered by TestControlBacklogGauge.
+    r->pending[control] = IHS_RETRANSMISSION_CONTROL_HARD_CAP;
+    CHECK(!QueueReliable(r, control, 7));
+
+    // IHS_SessionDisconnect queues a disconnect packet on the discovery channel via a 0 ms timer;
+    // wait for it (bounded, exits as soon as seen) to confirm the production disconnect path ran.
+    bool disconnected = false;
+    for (int i = 0; i < 100; i++) {
+        IHS_MutexLock(session->sendQueueMutex);
+        disconnected = !IHS_QueueIsEmpty(session->sendQueue);
+        IHS_MutexUnlock(session->sendQueueMutex);
+        if (disconnected) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(disconnected);
+
+    // Below the hard cap, a queue attempt is accepted again.
+    r->pending[control] = IHS_RETRANSMISSION_CONTROL_HARD_CAP - 1;
+    CHECK(QueueReliable(r, control, 8));
+
+    IHS_SessionDestroy(session);
+}
+
 }  // namespace
 
 int main() {
@@ -1213,6 +1362,9 @@ int main() {
     TestCancelCumulativeVsExact();
     TestRetransmitZombieGuard();
     TestControlBacklogGauge();
+    TestResyncFull();
+    TestHIDBackpressureAndResync();
+    TestControlHardCapDisconnect();
     TestSilenceMs();
     TestWakePacket();
     IHS_Quit();

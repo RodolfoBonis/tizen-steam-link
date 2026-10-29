@@ -117,7 +117,7 @@
                 audioFailed: 0, silenceFilled: 0, videoPackets: frames * 18, videoPacketsLost: Math.floor(frames / 40),
                 lostReports: 1, roundTripMs: 3.4, fec: true, fecRecovered: Math.floor(frames / 45),
                 fecUnrecoverable: 1, fullReportRequests: Math.floor(frames / 200), retransmitsAbandoned: 0,
-                controlPending: 2, controlMaxRetransmit: 3, hidBacklogDropped: 0});
+                controlPending: 2, controlMaxRetransmit: 3, hidReportsSkipped: 0});
         },
         setLogLevel: function () {},
     });

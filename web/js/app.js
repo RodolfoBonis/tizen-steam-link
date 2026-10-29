@@ -786,7 +786,7 @@
             'input: full-report requests ' + (st.fullReportRequests || 0) +
             ', retransmits given up ' + (st.retransmitsAbandoned || 0) + '\n' +
             'control backlog ' + (st.controlPending || 0) + ' (max resends ' + (st.controlMaxRetransmit || 0) +
-            '), HID dropped ' + (st.hidBacklogDropped || 0);
+            '), HID skipped ' + (st.hidReportsSkipped || 0);
     }
 
     // What the TV's player does with the frames: appended, decoded, shown.

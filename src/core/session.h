@@ -77,10 +77,10 @@ struct SessionStats {
     uint32_t fullReportRequests = 0;
     uint32_t retransmitsAbandoned = 0;
     // Control-channel retransmission backlog: packets awaiting ACK now, the worst retransmit count
-    // this session, and HID reports dropped because the backlog hit its cap.
+    // this session, and HID reports skipped because the backlog was at its soft cap.
     uint32_t controlPending = 0;
     uint32_t controlMaxRetransmit = 0;
-    uint32_t hidBacklogDropped = 0;
+    uint32_t hidReportsSkipped = 0;
     // The session ended because the host went silent, not by request.
     bool timedOut = false;
 };
