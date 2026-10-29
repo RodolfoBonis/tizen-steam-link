@@ -1,4 +1,4 @@
-Always send a requested full HID report, even when the pad state is unchanged.
+Always send a requested full HID report, and judge a delta against the batch's latest state.
 
 When the host's copy of a controller's state fails the CRC check carried with each delta, it
 asks the client for a full report (RequestFullReport) to resync. The client answers by packing
@@ -10,12 +10,20 @@ input "froze": a button held at that moment stayed pressed on the host and nothi
 through. Recovery only happened when a request happened to land in the few milliseconds after
 the pad changed but before the change was sent, which stick noise eventually made happen.
 
-IHS_HIDReportHolderAddFull now always queues the report, with no dedup. It still stashes the
-state as the pending current one, so a later delta dedups against it correctly. Deltas keep
-the dedup, which only ever drops a no-op delta.
+IHS_HIDReportHolderAddFull now always queues the report, with no dedup, still stashing the
+state so a later delta dedups against it. Deltas keep the dedup, but now compare against the
+most recent state queued this batch (pendingCurrent) when there is one, not only the last state
+flushed (lastSent): otherwise a delta right after a full report in the same batch - Full(Y)
+then Delta(X) - would be dropped as a no-op against the stale lastSent and leave the host at Y
+while the pad is at X.
+
+Because a full report is no longer deduped, IHS_SessionHIDSendReport now clears the holders
+when input streaming is off instead of returning early: a host RequestFullReport or a
+device-open full report while input is disabled would otherwise accumulate unsent and grow the
+per-device buffer without bound.
 
 diff --git a/src/hid/report.c b/src/hid/report.c
-index 00d9a6a..163d266 100644
+index 00d9a6a..0fbc22f 100644
 --- a/src/hid/report.c
 +++ b/src/hid/report.c
 @@ -60,14 +60,9 @@ void IHS_HIDReportHolderDeinit(IHS_HIDReportHolder *holder) {
@@ -36,24 +44,29 @@ index 00d9a6a..163d266 100644
      if (len > holder->bufferCapacity) {
          holder->lastSent = realloc(holder->lastSent, len);
          holder->pendingCurrent = realloc(holder->pendingCurrent, len);
-@@ -75,6 +70,16 @@ static bool DedupAndStash(IHS_HIDReportHolder *holder, const uint8_t *current, s
+@@ -75,6 +70,21 @@ static bool DedupAndStash(IHS_HIDReportHolder *holder, const uint8_t *current, s
      }
      memcpy(holder->pendingCurrent, current, len);
      holder->pendingCurrentLen = len;
 +}
 +
 +// Stash `current` as the pending state and decide whether to skip it because the bytes are
-+// byte-identical to what was last flushed. Returns true if the caller should drop.
++// byte-identical to the most recent state already queued this batch. Compares against
++// pendingCurrent (what has been added since the last flush) when there is one, else against
++// lastSent (what last went on the wire). Comparing against lastSent alone would drop a delta
++// that follows a full report in the same batch - Full(Y) then Delta(X) - and leave the host at
++// Y while the pad is at X. Returns true if the caller should drop it.
 +static bool DedupAndStash(IHS_HIDReportHolder *holder, const uint8_t *current, size_t len) {
-+    if (holder->lastSent != NULL && holder->lastSentLen == len &&
-+        memcmp(holder->lastSent, current, len) == 0) {
++    const uint8_t *compare = holder->pendingCurrentLen > 0 ? holder->pendingCurrent : holder->lastSent;
++    size_t compareLen = holder->pendingCurrentLen > 0 ? holder->pendingCurrentLen : holder->lastSentLen;
++    if (compare != NULL && compareLen == len && memcmp(compare, current, len) == 0) {
 +        return true;
 +    }
 +    StashCurrent(holder, current, len);
      return false;
  }
  
-@@ -84,9 +89,11 @@ void IHS_HIDReportHolderSetReportLength(IHS_HIDReportHolder *holder, size_t repo
+@@ -84,9 +94,12 @@ void IHS_HIDReportHolderSetReportLength(IHS_HIDReportHolder *holder, size_t repo
  
  void IHS_HIDReportHolderAddFull(IHS_HIDReportHolder *holder, const uint8_t *current, size_t len) {
      assert(holder->reportLength >= len);
@@ -63,8 +76,36 @@ index 00d9a6a..163d266 100644
 +    // Always queue a full report, even when the bytes equal the last send. The host asks for one
 +    // (RequestFullReport) after a CRC mismatch to resync, and the pad state usually hasn't changed
 +    // since the last send; dropping it as a duplicate leaves the host stuck on its stale copy,
-+    // which fails every later delta's CRC check. Still stash it so later deltas dedup correctly.
++    // which fails every later delta's CRC check. Still stash it so a later delta this batch dedups
++    // against it correctly.
 +    StashCurrent(holder, current, len);
      uint8_t *data = IHS_BufferPointerForAppend(&holder->dataBuffer, len);
      memcpy(data, current, len);
      holder->dataBuffer.size += len;
+diff --git a/src/session/channels/control/control_hid.c b/src/session/channels/control/control_hid.c
+index ec72707..7f2b28e 100644
+--- a/src/session/channels/control/control_hid.c
++++ b/src/session/channels/control/control_hid.c
+@@ -211,7 +211,21 @@ bool IHS_SessionHIDSendReport(IHS_Session *session) {
+     // Short-circuit before the per-device lock storm if input streaming is disabled.
+     // The polling task still calls device->poll() so device state stays current; only
+     // the wire send is suppressed (matches Steam's BStreamingInput gating behavior).
+-    if (!IHS_SessionInputEnabled(session)) return false;
++    // Drop anything already in the holders first: a full report is no longer deduped, so a
++    // host RequestFullReport or a device-open full report while input is off would otherwise
++    // pile up unsent and grow the per-device dataBuffer without bound.
++    if (!IHS_SessionInputEnabled(session)) {
++        size_t disabledCount;
++        IHS_HIDManagedDevice **disabledSnapshot = IHS_HIDManagerSnapshotOpenDevices(session->hidManager,
++                                                                                    &disabledCount);
++        for (size_t i = 0; i < disabledCount; ++i) {
++            IHS_MutexLock(disabledSnapshot[i]->lock);
++            IHS_HIDReportHolderResetMessage(&disabledSnapshot[i]->reportHolder);
++            IHS_MutexUnlock(disabledSnapshot[i]->lock);
++        }
++        free(disabledSnapshot);
++        return false;
++    }
+     CHIDMessageFromRemote outMessage = CHIDMESSAGE_FROM_REMOTE__INIT;
+     outMessage.command_case = CHIDMESSAGE_FROM_REMOTE__COMMAND_REPORTS;
+     CHIDMessageFromRemote__DeviceInputReports reports = CHIDMESSAGE_FROM_REMOTE__DEVICE_INPUT_REPORTS__INIT;

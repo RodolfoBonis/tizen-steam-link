@@ -1,53 +1,98 @@
-Cancel retransmission of every reliable packet an ACK covers, not just the one it names.
+Cancel retransmission of every reliable packet an ACK covers; keep a NACK exact.
 
 Steam acknowledges cumulatively: an ACK for packet n means it has every reliable packet up to
 n. The retransmission queue cancelled only the packet whose id the ACK named, so when a
 packet's own ACK was lost its timer kept resending it until it ran out of attempts, even though
 a later ACK had already told us it arrived. During play, with the control channel carrying
-250 reliable HID reports a second, that wasted a steady slice of the uplink and made a Wi-Fi
-stall worse, which is what tips a held button into a freeze.
+250 reliable HID reports a second, that wasted a steady slice of the uplink.
 
-IHS_RetransmissionCancel now marks as acked every pending packet on the channel whose id is
-<= the acked one, by 16-bit wraparound ((int16_t)(id - ackId) <= 0), so each one's timer skips
-its resend. The round trip is still sampled only from the exact packet the ACK names, since an
-earlier packet it also covers may have been sent more than once. Marking under the lock keeps
-patch 0019's ownership model: the timer task still frees the item.
+IHS_RetransmissionCancel now takes a `cumulative` flag. The receive path sets it for an ACK
+and clears it for a NACK: an ACK marks as acknowledged every pending packet on the channel at
+or before the acked id, by 16-bit wraparound (IHS_RetransmissionSeqCovered), while a NACK -
+which names one packet the host is still missing - marks only that exact id, as before. A
+cumulative NACK would cancel packets the host never received and silently drop HID input.
 
+The channel's newest cumulatively-acked id is remembered (ackedId/ackedValid, a NACK never
+advances it) so a packet a later ACK already covered can be dropped instead of resent forever
+(used by 0026). The round trip is still sampled only from the exact packet the ACK names, since
+an earlier packet it also covers may have been sent more than once. Marking under the lock keeps
+patch 0019's ownership model: the timer task still frees the item. The wraparound compare is
+correct only while no two live pending ids are more than 32767 apart, which the control backlog
+cap (0026) keeps true.
+
+diff --git a/src/session/channels/ch_discovery.c b/src/session/channels/ch_discovery.c
+index c2eb966..4e49657 100644
+--- a/src/session/channels/ch_discovery.c
++++ b/src/session/channels/ch_discovery.c
+@@ -110,7 +110,7 @@ static void OnConnectACK(IHS_SessionChannel *channel, const IHS_SessionPacket *p
+     // Drop stale / replayed ACKs that arrive after the handshake has progressed.
+     if (session->state.connectionState != IHS_SessionConnectionStateConnecting) return;
+     session->state.hostConnectionId = packet->header.srcConnectionId;
+-    IHS_SessionCancelRetransmission(session, IHS_SessionChannelIdDiscovery, 0, 0);
++    IHS_SessionCancelRetransmission(session, IHS_SessionChannelIdDiscovery, 0, 0, false);
+ 
+     IHS_SessionChannel *control = IHS_SessionChannelFor(session, IHS_SessionChannelIdControl);
+     IHS_SessionChannelControlHandshake(control, false);
 diff --git a/src/session/retransmission.c b/src/session/retransmission.c
-index da21947..5907f74 100644
+index c137464..6094975 100644
 --- a/src/session/retransmission.c
 +++ b/src/session/retransmission.c
-@@ -55,7 +55,7 @@ static void RetransmissionTimerEnd(void *context);
+@@ -45,8 +45,20 @@ typedef struct RetransmissionQuery {
+     IHS_SessionChannelId channelId;
+     uint16_t packetId;
+     uint16_t fragmentId;
++    bool cumulative;
+ } RetransmissionQuery;
  
- static bool RetransmissionIdenticalPredicate(PendingRetransmission *item, void *context);
++// channelId indexes the per-channel arrays directly; data channels (which never retransmit
++// reliably) fold onto the last slot so an out-of-range id can't run off the end.
++static unsigned RetransmissionChannelIndex(IHS_SessionChannelId channelId) {
++    return (unsigned) channelId < IHS_RETRANSMISSION_CHANNELS ? (unsigned) channelId
++                                                              : IHS_RETRANSMISSION_CHANNELS - 1;
++}
++
++bool IHS_RetransmissionSeqCovered(uint16_t id, uint16_t ackId) {
++    return (int16_t) (id - ackId) <= 0;
++}
++
+ static void RetransmissionQueueItemDestroy(PendingRetransmission *item, void *context);
  
--static bool RetransmissionPacketPredicate(PendingRetransmission *item, void *context);
-+static bool RetransmissionCumulativePredicate(PendingRetransmission *item, void *context);
+ static uint64_t RetransmissionTimerRun(int runCount, void *context);
+@@ -97,26 +109,43 @@ bool IHS_RetransmissionQueue(IHS_SessionRetransmission *retransmission, IHS_Sess
+ }
  
- void IHS_RetransmissionInit(IHS_SessionRetransmission *retransmission, IHS_Session *session) {
-     retransmission->session = session;
-@@ -103,20 +103,31 @@ bool IHS_RetransmissionCancel(IHS_SessionRetransmission *retransmission, IHS_Ses
+ bool IHS_RetransmissionCancel(IHS_SessionRetransmission *retransmission, IHS_SessionChannelId channelId,
+-                              uint16_t packetId, uint16_t fragmentId) {
++                              uint16_t packetId, uint16_t fragmentId, bool cumulative) {
+     RetransmissionQuery query = {
+             .channelId = channelId,
              .packetId = packetId,
              .fragmentId = fragmentId,
++            .cumulative = cumulative,
      };
-+    // Steam acknowledges cumulatively: an ACK for packetId covers every reliable packet up to it
-+    // on the channel. Mark every pending (non-acked) packet on this channel whose id is <= the
-+    // acked one, by 16-bit wraparound, so its timer skips the resend. Without this a packet whose
-+    // own ACK was lost kept being resent until it ran out of attempts, wasting the uplink.
++    unsigned idx = RetransmissionChannelIndex(channelId);
      IHS_MutexLock(retransmission->lock);
 -    PendingRetransmission *match = IHS_QueueFindBy(retransmission->queue, RetransmissionPacketPredicate, &query);
++    // An ACK covers every earlier packet; record the newest covered id so a later (re)queue of a
++    // packet it already covered can be dropped (see IHS_RetransmissionQueue). A NACK is not an
++    // acknowledgement of receipt, so it must not advance this or cancel anything but its exact id.
++    if (cumulative && (!retransmission->ackedValid[idx] ||
++                       IHS_RetransmissionSeqCovered(retransmission->ackedId[idx], packetId))) {
++        retransmission->ackedValid[idx] = true;
++        retransmission->ackedId[idx] = packetId;
++    }
 +    bool any = false;
 +    bool exactMatched = false;
      uint8_t retransmitCount = 0;
      uint32_t sendTimestamp = 0;
 -    if (match != NULL) {
 +    PendingRetransmission *match;
-+    while ((match = IHS_QueueFindBy(retransmission->queue, RetransmissionCumulativePredicate, &query)) != NULL) {
++    while ((match = IHS_QueueFindBy(retransmission->queue, RetransmissionPacketPredicate, &query)) != NULL) {
          match->acked = true;
 -        retransmitCount = match->packet.header.retransmitCount;
 -        sendTimestamp = match->packet.header.sendTimestamp;
 +        any = true;
-+        // RTT only from the exact packet the ACK names, not an earlier one it also covers.
++        // RTT only from the exact packet the ACK/NACK names, not an earlier one an ACK also covers.
 +        if (match->packet.header.packetId == packetId && match->packet.header.fragmentId == fragmentId) {
 +            exactMatched = true;
 +            retransmitCount = match->packet.header.retransmitCount;
@@ -64,29 +109,115 @@ index da21947..5907f74 100644
          // Sent once (the queued copy counts 1), so the ACK can only be for that send. Smoothed
          // like TCP's SRTT, by 1/8 per sample.
          IHS_Session *session = retransmission->session;
-@@ -129,7 +140,7 @@ bool IHS_RetransmissionCancel(IHS_SessionRetransmission *retransmission, IHS_Ses
+@@ -129,8 +158,8 @@ bool IHS_RetransmissionCancel(IHS_SessionRetransmission *retransmission, IHS_Ses
                                rtt == 0 ? sample : (uint32_t) ((int64_t) rtt + ((int64_t) sample - rtt) / 8));
      }
      IHS_SessionLog(retransmission->session, IHS_LogLevelVerbose, "Retransmission",
 -                   "Cancelling Packet(channelId=%u, packetId=%u, fragmentId=%u), retransmitCount=%u",
-+                   "Cancelling up to Packet(channelId=%u, packetId=%u, fragmentId=%u), retransmitCount=%u",
-                    channelId, packetId, fragmentId, retransmitCount);
+-                   channelId, packetId, fragmentId, retransmitCount);
++                   "Cancelling %s Packet(channelId=%u, packetId=%u, fragmentId=%u), retransmitCount=%u",
++                   cumulative ? "up to" : "exact", channelId, packetId, fragmentId, retransmitCount);
      return true;
  }
-@@ -189,9 +200,11 @@ static bool RetransmissionIdenticalPredicate(PendingRetransmission *item, void *
-     return item == context;
- }
  
--static bool RetransmissionPacketPredicate(PendingRetransmission *item, void *context) {
-+static bool RetransmissionCumulativePredicate(PendingRetransmission *item, void *context) {
+@@ -190,7 +219,12 @@ static bool RetransmissionIdenticalPredicate(PendingRetransmission *item, void *
+ 
+ static bool RetransmissionPacketPredicate(PendingRetransmission *item, void *context) {
      RetransmissionQuery *query = context;
 -    return !item->acked && item->packet.header.channelId == query->channelId &&
 -           item->packet.header.packetId == query->packetId &&
--           item->packet.header.fragmentId == query->fragmentId;
 +    if (item->acked || item->packet.header.channelId != query->channelId) {
 +        return false;
 +    }
-+    // 16-bit wraparound: packetId <= the acked id.
-+    return (int16_t) (item->packet.header.packetId - query->packetId) <= 0;
++    if (query->cumulative) {
++        return IHS_RetransmissionSeqCovered(item->packet.header.packetId, query->packetId);
++    }
++    return item->packet.header.packetId == query->packetId &&
+            item->packet.header.fragmentId == query->fragmentId;
  }
 \ No newline at end of file
+diff --git a/src/session/retransmission.h b/src/session/retransmission.h
+index f3a341b..d99a2a3 100644
+--- a/src/session/retransmission.h
++++ b/src/session/retransmission.h
+@@ -32,17 +32,40 @@
+ 
+ typedef struct IHS_Session IHS_Session;
+ 
++// Channels that use reliable retransmission: discovery (0), control (1), stats (2). Data
++// channels are unreliable and never come here. Sized to index by channelId directly.
++#define IHS_RETRANSMISSION_CHANNELS 8
++
+ typedef struct IHS_SessionRetransmission {
+     IHS_Session *session;
+     IHS_Mutex *lock;
+     IHS_Queue *queue;
++    // The newest id a cumulative ACK has covered on each channel (16-bit, wraparound), under
++    // `lock`. An ACK sets it, a NACK does not. Used to drop a (re)queue a later ACK already
++    // covered.
++    bool ackedValid[IHS_RETRANSMISSION_CHANNELS];
++    uint16_t ackedId[IHS_RETRANSMISSION_CHANNELS];
+ } IHS_SessionRetransmission;
+ 
++/**
++ * Cumulative-ACK coverage with 16-bit wraparound: is \p id at or before \p ackId? Correct only
++ * while no two live pending ids are more than 32767 apart, which the control backlog cap keeps
++ * true (pending < 32768).
++ */
++bool IHS_RetransmissionSeqCovered(uint16_t id, uint16_t ackId);
++
+ void IHS_RetransmissionInit(IHS_SessionRetransmission *retransmission, IHS_Session *session);
+ 
+ void IHS_RetransmissionDeinit(IHS_SessionRetransmission *retransmission);
+ 
+ bool IHS_RetransmissionQueue(IHS_SessionRetransmission *retransmission, IHS_SessionPacket *packet);
+ 
++/**
++ * Mark pending packets acknowledged so their timers stop resending. With \p cumulative (an ACK,
++ * which Steam sends cumulatively), every pending packet on the channel at or before \p packetId
++ * is marked and the channel's acked id advances. Without it (a NACK), only the exact
++ * packetId/fragmentId is marked. The round trip is sampled only from the exact packet.
++ * @return true if any pending packet was marked
++ */
+ bool IHS_RetransmissionCancel(IHS_SessionRetransmission *retransmission, IHS_SessionChannelId channelId,
+-                              uint16_t packetId, uint16_t fragmentId);
++                              uint16_t packetId, uint16_t fragmentId, bool cumulative);
+diff --git a/src/session/session.c b/src/session/session.c
+index db7aa99..4f36b1e 100644
+--- a/src/session/session.c
++++ b/src/session/session.c
+@@ -187,8 +187,8 @@ bool IHS_SessionSendControlMessage(IHS_Session *session, EStreamControlMessage t
+ }
+ 
+ bool IHS_SessionCancelRetransmission(IHS_Session *session, IHS_SessionChannelId channelId, uint16_t packetId,
+-                                     uint16_t fragmentId) {
+-    return IHS_RetransmissionCancel(&session->retransmission, channelId, packetId, fragmentId);
++                                     uint16_t fragmentId, bool cumulative) {
++    return IHS_RetransmissionCancel(&session->retransmission, channelId, packetId, fragmentId, cumulative);
+ }
+ 
+ void IHS_SessionHIDAddProvider(IHS_Session *session, IHS_HIDProvider *provider) {
+@@ -235,8 +235,11 @@ static void SessionRecvCallback(IHS_Base *base, const IHS_SocketAddress *address
+     IHS_SessionChannelId channelId = packet.header.channelId;
+     IHS_SessionPacketType packetType = packet.header.type;
+     if (packetType == IHS_SessionPacketTypeACK || packetType == IHS_SessionPacketTypeNACK) {
+-        // Stop retransmission task
+-        IHS_SessionCancelRetransmission(session, channelId, packet.header.packetId, packet.header.fragmentId);
++        // Stop retransmission. Steam's ACKs are cumulative (they cover every earlier packet); a
++        // NACK names one packet the host is missing, so it must cancel only that exact id - a
++        // cumulative NACK would cancel packets the host never got and silently lose HID input.
++        IHS_SessionCancelRetransmission(session, channelId, packet.header.packetId, packet.header.fragmentId,
++                                        packetType == IHS_SessionPacketTypeACK);
+     }
+     IHS_SessionChannel *channel = IHS_SessionChannelFor(session, channelId);
+     if (channel != NULL) {
+diff --git a/src/session/session_pri.h b/src/session/session_pri.h
+index 152e177..a67cc6d 100644
+--- a/src/session/session_pri.h
++++ b/src/session/session_pri.h
+@@ -166,4 +166,4 @@ bool IHS_SessionSendControlMessage(IHS_Session *session, EStreamControlMessage t
+ bool IHS_SessionInputEnabled(IHS_Session *session);
+ 
+ bool IHS_SessionCancelRetransmission(IHS_Session *session, IHS_SessionChannelId channelId, uint16_t packetId,
+-                                     uint16_t fragmentId);
++                                     uint16_t fragmentId, bool cumulative);

@@ -931,10 +931,12 @@ void TestRetransmissionCancelRacesTimer() {
         return any;
     };
 
-    // Acknowledged well before its timer: cancelled once, and never sent again.
+    // Acknowledged well before its timer: cancelled once, and never sent again. Exact (NACK-style)
+    // cancelling keeps each queue/cancel pair to one packet id, so this isolates the ACK-vs-timer
+    // race without the cumulative coverage that TestCancelCumulativeVsExact checks.
     CHECK(queue(1));
-    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0));
-    CHECK(!IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0));
+    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0, false));
+    CHECK(!IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0, false));
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
     CHECK(!resent());
     // Not acknowledged: sent again when the timer fires.
@@ -952,7 +954,7 @@ void TestRetransmissionCancelRacesTimer() {
                 auto packetId = static_cast<uint16_t>(1000 + t * 1000 + i);
                 if (!queue(packetId)) notQueued++;
                 std::this_thread::sleep_for(std::chrono::microseconds(9000 + (i % 21) * 100));
-                IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, packetId, 0);
+                IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, packetId, 0, false);
             }
         });
     }
@@ -963,28 +965,30 @@ void TestRetransmissionCancelRacesTimer() {
 }
 
 
-// The host asks for a full controller report (RequestFullReport) to resync after a CRC
-// mismatch, and the pad state usually hasn't changed since the last send. A delta with an
-// unchanged state is deduped away, but the full report the host asked for must still go out,
-// or the host stays stuck on its stale copy and input freezes.
-void TestFullReportBypassesDedup() {
+// Full HID reports and the dedup. A full report the host asks for (RequestFullReport) must go
+// out even when the pad state is unchanged, or the host stays stuck on its stale copy and input
+// freezes. And a delta right after a full report in the same batch - Full(Y) then Delta(X) -
+// must survive, or the host ends at Y while the pad is at X.
+void TestFullReportDedup() {
     IHS_HIDReportHolder holder;
     IHS_HIDReportHolderInit(&holder, 1);
     IHS_HIDReportHolderSetReportLength(&holder, 48);
-    uint8_t state[48] = {0};
-    state[0] = 0x11;
+    uint8_t x[48] = {0};
+    x[0] = 0x11;
+    uint8_t y[48] = {0};
+    y[0] = 0x22;
 
     // First full report is queued, then flushed (ResetMessage promotes it to "last sent").
-    IHS_HIDReportHolderAddFull(&holder, state, 48);
+    IHS_HIDReportHolderAddFull(&holder, x, 48);
     CHECK(IHS_HIDReportHolderGetMessage(&holder) != nullptr);
     IHS_HIDReportHolderResetMessage(&holder);
 
     // A delta with the identical state is dropped as a no-op.
-    IHS_HIDReportHolderAddDelta(&holder, state, state, 48);
+    IHS_HIDReportHolderAddDelta(&holder, x, x, 48);
     CHECK(IHS_HIDReportHolderGetMessage(&holder) == nullptr);
 
     // But a full report with that same state is still queued.
-    IHS_HIDReportHolderAddFull(&holder, state, 48);
+    IHS_HIDReportHolderAddFull(&holder, x, 48);
     IHS_HIDDeviceReportMessage *msg = IHS_HIDReportHolderGetMessage(&holder);
     CHECK(msg != nullptr);
     if (msg != nullptr) {
@@ -992,13 +996,67 @@ void TestFullReportBypassesDedup() {
         CHECK(msg->reports[0]->has_full_report);
     }
     IHS_HIDReportHolderResetMessage(&holder);
+
+    // Full(Y) then Delta(X) in one batch: the delta must not be dropped against the old lastSent.
+    IHS_HIDReportHolderAddFull(&holder, y, 48);
+    IHS_HIDReportHolderAddDelta(&holder, y, x, 48);
+    msg = IHS_HIDReportHolderGetMessage(&holder);
+    CHECK(msg != nullptr);
+    if (msg != nullptr) {
+        CHECK_EQ(msg->n_reports, 2u);          // the full report and the delta
+        CHECK(msg->reports[0]->has_full_report);
+        CHECK(msg->reports[1]->has_delta_report);
+    }
+    IHS_HIDReportHolderResetMessage(&holder);
     IHS_HIDReportHolderDeinit(&holder);
 }
 
-// Makes a session that sends nothing (not connected), so a retransmit stays in the send queue
-// and can be observed. The caller owns it and must IHS_SessionDestroy it.
+// The pure retransmission policy helpers, no threads or timers: cumulative-ACK coverage with
+// 16-bit wraparound, when to keep retransmitting, the backoff schedule, and the backlog cap.
+void TestRetransmissionPolicy() {
+    // Cumulative coverage, wraparound included.
+    CHECK(IHS_RetransmissionSeqCovered(10, 10));
+    CHECK(IHS_RetransmissionSeqCovered(9, 10));
+    CHECK(!IHS_RetransmissionSeqCovered(11, 10));
+    CHECK(IHS_RetransmissionSeqCovered(65535, 1));   // 65535 is just before 1
+    CHECK(IHS_RetransmissionSeqCovered(0, 1));
+    CHECK(!IHS_RetransmissionSeqCovered(2, 1));
+
+    // Control keeps going past the 20-attempt cap; other channels give up at it.
+    CHECK(IHS_RetransmissionKeepGoing(IHS_SessionChannelIdControl, 20));
+    CHECK(IHS_RetransmissionKeepGoing(IHS_SessionChannelIdControl, 200));
+    CHECK(IHS_RetransmissionKeepGoing(IHS_SessionChannelIdStats, 19));
+    CHECK(!IHS_RetransmissionKeepGoing(IHS_SessionChannelIdStats, 20));
+
+    // Backoff: control doubles from 10 ms, capped at 200 ms; other channels stay at 10 ms.
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 1), 10u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 2), 20u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 3), 40u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 4), 80u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 5), 160u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 6), 200u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdControl, 200), 200u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdStats, 1), 10u);
+    CHECK_EQ(IHS_RetransmissionBackoffMs(IHS_SessionChannelIdStats, 7), 10u);
+
+    // Backlog cap: only control is capped; a HID report is dropped, anything else disconnects.
+    uint32_t cap = IHS_RETRANSMISSION_CONTROL_PENDING_CAP;
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, cap - 1, true),
+             IHS_RetransmissionActionQueue);
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, cap, true),
+             IHS_RetransmissionActionDropHid);
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdControl, cap, false),
+             IHS_RetransmissionActionDisconnect);
+    CHECK_EQ(IHS_RetransmissionBacklogAction(IHS_SessionChannelIdStats, cap + 1000, false),
+             IHS_RetransmissionActionQueue);
+}
+
+// Makes a session that sends nothing (not connected), so a retransmit stays in the send queue.
+// The caller owns it and must IHS_SessionDestroy it.
 IHS_Session *MakeLoopbackSession(uint8_t seed) {
-    uint8_t random[tsl::Identity::kRandomBytes] = {seed};
+    static uint8_t random[tsl::Identity::kRandomBytes];
+    std::memset(random, 0, sizeof(random));
+    random[0] = seed;
     tsl::Identity id = tsl::Identity::FromRandom(random, "test");
     static IHS_ClientConfig config;
     config = id.ClientConfig();
@@ -1012,102 +1070,118 @@ IHS_Session *MakeLoopbackSession(uint8_t seed) {
     return IHS_SessionCreate(&config, &info);
 }
 
-// Steam acknowledges cumulatively: an ACK for packet n covers every earlier reliable packet on
-// the channel. Cancelling must mark all of them, by 16-bit wraparound, so none keeps resending.
-void TestCumulativeAckCancel() {
-    IHS_Session *session = MakeLoopbackSession(5);
-    IHS_SessionRetransmission *retransmission = &session->retransmission;
-    auto queue = [&](uint16_t packetId) {
-        IHS_SessionPacket packet{};
-        packet.header.type = IHS_SessionPacketTypeReliable;
-        packet.header.channelId = IHS_SessionChannelIdControl;
-        packet.header.packetId = packetId;
-        packet.header.sendTimestamp = IHS_SessionPacketTimestamp();
-        IHS_SessionPacketBodyInitialize(&packet.body, false);
-        const uint8_t payload[1] = {0};
-        IHS_BufferAppendMem(&packet.body, payload, sizeof(payload));
-        bool queued = IHS_RetransmissionQueue(retransmission, &packet);
-        IHS_SessionPacketClear(&packet, true);
-        return queued;
-    };
-    auto resent = [&] {
-        IHS_MutexLock(session->sendQueueMutex);
-        bool any = !IHS_QueueIsEmpty(session->sendQueue);
-        IHS_MutexUnlock(session->sendQueueMutex);
-        return any;
-    };
-
-    // Five packets, one cumulative ACK for the newest cancels all of them.
-    for (uint16_t id = 100; id <= 104; id++) CHECK(queue(id));
-    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 104, 0));
-    // Everything is acked now, so a repeat finds nothing.
-    CHECK(!IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 104, 0));
-
-    // Wraparound: ids straddling 0, one ACK for 1 covers 65534, 65535, 0 and 1.
-    CHECK(queue(65534));
-    CHECK(queue(65535));
-    CHECK(queue(0));
-    CHECK(queue(1));
-    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0));
-    CHECK(!IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0));
-
-    // Give every timer time to fire; all are acked, so none resends.
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    CHECK(!resent());
-    IHS_SessionDestroy(session);
+// Queues a reliable packet on a channel with a given starting retransmitCount. Returns whether it
+// was queued (false if dropped as already-acked, over the cap, or past a channel's attempts).
+bool QueueReliable(IHS_SessionRetransmission *retransmission, IHS_SessionChannelId channelId, uint16_t packetId,
+                   uint8_t retransmitCount = 0, bool droppable = false) {
+    IHS_SessionPacket packet{};
+    packet.header.type = IHS_SessionPacketTypeReliable;
+    packet.header.channelId = channelId;
+    packet.header.packetId = packetId;
+    packet.header.retransmitCount = retransmitCount;
+    packet.header.droppable = droppable;
+    packet.header.sendTimestamp = IHS_SessionPacketTimestamp();
+    IHS_SessionPacketBodyInitialize(&packet.body, false);
+    const uint8_t payload[1] = {0};
+    IHS_BufferAppendMem(&packet.body, payload, sizeof(payload));
+    bool queued = IHS_RetransmissionQueue(retransmission, &packet);
+    IHS_SessionPacketClear(&packet, true);
+    return queued;
 }
 
-// A control-channel reliable packet must keep retransmitting past the 20-attempt cap until it is
-// acknowledged (Steam's own client does), while other channels still give up at the cap.
-void TestControlRetransmitUntilAcked() {
+// Cancel semantics, checked synchronously by Cancel's return (true iff it marked a live packet),
+// no sleeps: an ACK is cumulative, a NACK is exact, and an ACK never covers a later id. Every
+// packet is on the control channel unless noted.
+void TestCancelCumulativeVsExact() {
+    IHS_Session *session = MakeLoopbackSession(5);
+    IHS_SessionRetransmission *r = &session->retransmission;
+    const IHS_SessionChannelId control = IHS_SessionChannelIdControl;
+    const bool ACK = true, NACK = false;
+
+    // Ids ascend through the test: a cumulative ACK advances the channel's acked id, so a later
+    // queue of a lower id would (correctly) be refused as already covered. Wraparound gets its
+    // own session below, with a fresh acked id.
+
+    // One cumulative ACK for the newest covers all five; a repeat finds none left.
+    for (uint16_t id = 100; id <= 104; id++) CHECK(QueueReliable(r, control, id));
+    CHECK(IHS_RetransmissionCancel(r, control, 104, 0, ACK));
+    CHECK(!IHS_RetransmissionCancel(r, control, 104, 0, ACK));
+
+    // An ACK for n does not cover n+1: 112 survives an ACK of 111, and a NACK is exact.
+    CHECK(QueueReliable(r, control, 111));
+    CHECK(QueueReliable(r, control, 112));
+    CHECK(IHS_RetransmissionCancel(r, control, 111, 0, ACK));   // marks 111 only
+    CHECK(!IHS_RetransmissionCancel(r, control, 111, 0, ACK));  // 111 gone, 112 not covered
+    CHECK(IHS_RetransmissionCancel(r, control, 112, 0, NACK));  // 112 still live, exact NACK marks it
+    CHECK(!IHS_RetransmissionCancel(r, control, 112, 0, NACK));
+
+    // A NACK is not cumulative and does not advance the acked id: NACK(122) must not touch the
+    // earlier 120 and 121, which stay live for their own exact cancels.
+    CHECK(QueueReliable(r, control, 120));
+    CHECK(QueueReliable(r, control, 121));
+    CHECK(QueueReliable(r, control, 122));
+    CHECK(IHS_RetransmissionCancel(r, control, 122, 0, NACK));   // only 122
+    CHECK(!IHS_RetransmissionCancel(r, control, 122, 0, NACK));
+    CHECK(IHS_RetransmissionCancel(r, control, 120, 0, NACK));   // 120 was left live
+    CHECK(IHS_RetransmissionCancel(r, control, 121, 0, NACK));   // 121 was left live
+    IHS_SessionDestroy(session);
+
+    // Wraparound on a fresh session: one ACK for 1 covers 65534, 65535, 0 and 1.
+    IHS_Session *wrap = MakeLoopbackSession(9);
+    IHS_SessionRetransmission *rw = &wrap->retransmission;
+    CHECK(QueueReliable(rw, control, 65534));
+    CHECK(QueueReliable(rw, control, 65535));
+    CHECK(QueueReliable(rw, control, 0));
+    CHECK(QueueReliable(rw, control, 1));
+    CHECK(IHS_RetransmissionCancel(rw, control, 1, 0, ACK));
+    CHECK(!IHS_RetransmissionCancel(rw, control, 1, 0, ACK));
+    IHS_SessionDestroy(wrap);
+}
+
+// The zombie guard: once a cumulative ACK has covered an id on a channel, re-queuing a packet at
+// or before it is refused, so a resend the receive thread already acked can't loop forever.
+void TestRetransmitZombieGuard() {
     IHS_Session *session = MakeLoopbackSession(6);
-    IHS_SessionRetransmission *retransmission = &session->retransmission;
-    auto queueCount = [&](uint16_t packetId, IHS_SessionChannelId channelId, uint8_t count) {
-        IHS_SessionPacket packet{};
-        packet.header.type = IHS_SessionPacketTypeReliable;
-        packet.header.channelId = channelId;
-        packet.header.packetId = packetId;
-        packet.header.retransmitCount = count;
-        packet.header.sendTimestamp = IHS_SessionPacketTimestamp();
-        IHS_SessionPacketBodyInitialize(&packet.body, false);
-        const uint8_t payload[1] = {0};
-        IHS_BufferAppendMem(&packet.body, payload, sizeof(payload));
-        bool queued = IHS_RetransmissionQueue(retransmission, &packet);
-        IHS_SessionPacketClear(&packet, true);
-        return queued;
-    };
-    auto resent = [&] {
-        IHS_MutexLock(session->sendQueueMutex);
-        bool any = !IHS_QueueIsEmpty(session->sendQueue);
-        IHS_MutexUnlock(session->sendQueueMutex);
-        return any;
-    };
+    IHS_SessionRetransmission *r = &session->retransmission;
+    const IHS_SessionChannelId control = IHS_SessionChannelIdControl;
 
-    // Control keeps going well past the cap; retransmitCount saturates at 255 instead of wrapping.
-    CHECK(queueCount(200, IHS_SessionChannelIdControl, 25));
-    CHECK(queueCount(201, IHS_SessionChannelIdControl, 254));
-    CHECK(queueCount(202, IHS_SessionChannelIdControl, 255));
-    // Another channel still gives up at the cap.
-    CHECK(!queueCount(210, IHS_SessionChannelIdStats, 20));
-    CHECK(queueCount(211, IHS_SessionChannelIdStats, 5));
-    // Acknowledge everything queued (cumulative) so nothing lingers in the send queue.
-    IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 202, 0);
-    IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdStats, 211, 0);
+    // A cumulative ACK for 500 advances the channel's acked id even with nothing pending.
+    CHECK(!IHS_RetransmissionCancel(r, control, 500, 0, true));
+    // Re-queuing a covered id is refused; a newer id still queues.
+    CHECK(!QueueReliable(r, control, 499));
+    CHECK(!QueueReliable(r, control, 500));
+    CHECK(QueueReliable(r, control, 501));
+    // A NACK does not advance the acked id, so it can't create this guard by itself.
+    IHS_Session *session2 = MakeLoopbackSession(7);
+    IHS_SessionRetransmission *r2 = &session2->retransmission;
+    CHECK(!IHS_RetransmissionCancel(r2, control, 500, 0, false));
+    CHECK(QueueReliable(r2, control, 499));  // not covered: a NACK didn't move the acked id
 
-    // An acked control packet is never resent: the queue stays empty.
-    CHECK(queueCount(301, IHS_SessionChannelIdControl, 1));
-    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 301, 0));
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    CHECK(!resent());
+    IHS_SessionDestroy(session);
+    IHS_SessionDestroy(session2);
+}
 
-    // An unacked control packet is resent when its timer fires.
-    CHECK(queueCount(300, IHS_SessionChannelIdControl, 1));
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    CHECK(resent());
+// The control backlog gauge tracks pending packets, and acknowledging them clears it. (The cap
+// decision itself is covered deterministically by TestRetransmissionPolicy.)
+void TestControlBacklogGauge() {
+    IHS_Session *session = MakeLoopbackSession(8);
+    IHS_SessionRetransmission *r = &session->retransmission;
+    const IHS_SessionChannelId control = IHS_SessionChannelIdControl;
 
-    // Acknowledge it so its resend chain stops before teardown.
-    IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 300, 0);
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    for (uint16_t id = 1; id <= 4; id++) CHECK(QueueReliable(r, control, id));
+    IHS_SessionStreamStats stats;
+    IHS_SessionGetStreamStats(session, &stats);
+    CHECK_EQ(stats.controlPending, 4u);
+    CHECK(stats.controlMaxRetransmit >= 1u);
+
+    // A cumulative ACK marks them acked; their timers then drop them and the gauge falls to 0.
+    CHECK(IHS_RetransmissionCancel(r, control, 4, 0, true));
+    for (int i = 0; i < 50; i++) {
+        IHS_SessionGetStreamStats(session, &stats);
+        if (stats.controlPending == 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK_EQ(stats.controlPending, 0u);
     IHS_SessionDestroy(session);
 }
 
@@ -1134,9 +1208,11 @@ int main() {
     TestFec();
     TestDataChannelGetsPastLostPacket();
     TestRetransmissionCancelRacesTimer();
-    TestFullReportBypassesDedup();
-    TestCumulativeAckCancel();
-    TestControlRetransmitUntilAcked();
+    TestFullReportDedup();
+    TestRetransmissionPolicy();
+    TestCancelCumulativeVsExact();
+    TestRetransmitZombieGuard();
+    TestControlBacklogGauge();
     TestSilenceMs();
     TestWakePacket();
     IHS_Quit();

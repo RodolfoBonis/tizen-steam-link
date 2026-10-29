@@ -295,7 +295,10 @@ public:
                ",\"fecRecovered\":" + std::to_string(s.fecRecovered) + ",\"fecUnrecoverable\":" +
                std::to_string(s.fecUnrecoverable) + ",\"fullReportRequests\":" +
                std::to_string(s.fullReportRequests) + ",\"retransmitsAbandoned\":" +
-               std::to_string(s.retransmitsAbandoned) + ",\"videoSessionChanges\":" +
+               std::to_string(s.retransmitsAbandoned) + ",\"controlPending\":" +
+               std::to_string(s.controlPending) + ",\"controlMaxRetransmit\":" +
+               std::to_string(s.controlMaxRetransmit) + ",\"hidBacklogDropped\":" +
+               std::to_string(s.hidBacklogDropped) + ",\"videoSessionChanges\":" +
                std::to_string(c.videoSessionChanges) + ",\"videoTrackCloses\":" + std::to_string(c.videoTrackCloses) +
                ",\"lastCloseReason\":" + std::to_string(c.lastCloseReason) + ",\"lastAppendError\":" +
                std::to_string(c.lastAppendError) + ",\"pipelineErrors\":" + std::to_string(c.pipelineErrors) +

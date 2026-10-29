@@ -784,7 +784,9 @@
             '   keyframe requests ' + (st.lostReports || 0) + '\n' +
             'round trip ' + (st.roundTripMs > 0 ? st.roundTripMs.toFixed(1) + ' ms' : 'not measured yet') + '\n' +
             'input: full-report requests ' + (st.fullReportRequests || 0) +
-            ', retransmits given up ' + (st.retransmitsAbandoned || 0);
+            ', retransmits given up ' + (st.retransmitsAbandoned || 0) + '\n' +
+            'control backlog ' + (st.controlPending || 0) + ' (max resends ' + (st.controlMaxRetransmit || 0) +
+            '), HID dropped ' + (st.hidBacklogDropped || 0);
     }
 
     // What the TV's player does with the frames: appended, decoded, shown.
