@@ -116,7 +116,7 @@
                 framerateNum: 60, framerateDen: 1, videoAppended: frames, videoFailed: 0, audioAppended: audio,
                 audioFailed: 0, silenceFilled: 0, videoPackets: frames * 18, videoPacketsLost: Math.floor(frames / 40),
                 lostReports: 1, roundTripMs: 3.4, fec: true, fecRecovered: Math.floor(frames / 45),
-                fecUnrecoverable: 1});
+                fecUnrecoverable: 1, fullReportRequests: Math.floor(frames / 200), retransmitsAbandoned: 0});
         },
         setLogLevel: function () {},
     });

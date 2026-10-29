@@ -27,6 +27,7 @@ extern "C" {
 #include "hid/device.h"
 #include "hid/manager.h"
 #include "hid/provider.h"
+#include "hid/report.h"
 #include "ihs_buffer.h"
 #include "ihs_enumeration.h"
 #include "protobuf/discovery.pb-c.h"
@@ -961,6 +962,155 @@ void TestRetransmissionCancelRacesTimer() {
     IHS_SessionDestroy(session);
 }
 
+
+// The host asks for a full controller report (RequestFullReport) to resync after a CRC
+// mismatch, and the pad state usually hasn't changed since the last send. A delta with an
+// unchanged state is deduped away, but the full report the host asked for must still go out,
+// or the host stays stuck on its stale copy and input freezes.
+void TestFullReportBypassesDedup() {
+    IHS_HIDReportHolder holder;
+    IHS_HIDReportHolderInit(&holder, 1);
+    IHS_HIDReportHolderSetReportLength(&holder, 48);
+    uint8_t state[48] = {0};
+    state[0] = 0x11;
+
+    // First full report is queued, then flushed (ResetMessage promotes it to "last sent").
+    IHS_HIDReportHolderAddFull(&holder, state, 48);
+    CHECK(IHS_HIDReportHolderGetMessage(&holder) != nullptr);
+    IHS_HIDReportHolderResetMessage(&holder);
+
+    // A delta with the identical state is dropped as a no-op.
+    IHS_HIDReportHolderAddDelta(&holder, state, state, 48);
+    CHECK(IHS_HIDReportHolderGetMessage(&holder) == nullptr);
+
+    // But a full report with that same state is still queued.
+    IHS_HIDReportHolderAddFull(&holder, state, 48);
+    IHS_HIDDeviceReportMessage *msg = IHS_HIDReportHolderGetMessage(&holder);
+    CHECK(msg != nullptr);
+    if (msg != nullptr) {
+        CHECK_EQ(msg->n_reports, 1u);
+        CHECK(msg->reports[0]->has_full_report);
+    }
+    IHS_HIDReportHolderResetMessage(&holder);
+    IHS_HIDReportHolderDeinit(&holder);
+}
+
+// Makes a session that sends nothing (not connected), so a retransmit stays in the send queue
+// and can be observed. The caller owns it and must IHS_SessionDestroy it.
+IHS_Session *MakeLoopbackSession(uint8_t seed) {
+    uint8_t random[tsl::Identity::kRandomBytes] = {seed};
+    tsl::Identity id = tsl::Identity::FromRandom(random, "test");
+    static IHS_ClientConfig config;
+    config = id.ClientConfig();
+    static tsl::HostKey key;
+    key = tsl::HostKey{};
+    config.secretKey = key.data();
+    IHS_SessionInfo info{};
+    IHS_IPAddressFromString(&info.address.ip, "127.0.0.1");
+    info.address.port = 27031;
+    info.sessionKeyLen = 32;
+    return IHS_SessionCreate(&config, &info);
+}
+
+// Steam acknowledges cumulatively: an ACK for packet n covers every earlier reliable packet on
+// the channel. Cancelling must mark all of them, by 16-bit wraparound, so none keeps resending.
+void TestCumulativeAckCancel() {
+    IHS_Session *session = MakeLoopbackSession(5);
+    IHS_SessionRetransmission *retransmission = &session->retransmission;
+    auto queue = [&](uint16_t packetId) {
+        IHS_SessionPacket packet{};
+        packet.header.type = IHS_SessionPacketTypeReliable;
+        packet.header.channelId = IHS_SessionChannelIdControl;
+        packet.header.packetId = packetId;
+        packet.header.sendTimestamp = IHS_SessionPacketTimestamp();
+        IHS_SessionPacketBodyInitialize(&packet.body, false);
+        const uint8_t payload[1] = {0};
+        IHS_BufferAppendMem(&packet.body, payload, sizeof(payload));
+        bool queued = IHS_RetransmissionQueue(retransmission, &packet);
+        IHS_SessionPacketClear(&packet, true);
+        return queued;
+    };
+    auto resent = [&] {
+        IHS_MutexLock(session->sendQueueMutex);
+        bool any = !IHS_QueueIsEmpty(session->sendQueue);
+        IHS_MutexUnlock(session->sendQueueMutex);
+        return any;
+    };
+
+    // Five packets, one cumulative ACK for the newest cancels all of them.
+    for (uint16_t id = 100; id <= 104; id++) CHECK(queue(id));
+    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 104, 0));
+    // Everything is acked now, so a repeat finds nothing.
+    CHECK(!IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 104, 0));
+
+    // Wraparound: ids straddling 0, one ACK for 1 covers 65534, 65535, 0 and 1.
+    CHECK(queue(65534));
+    CHECK(queue(65535));
+    CHECK(queue(0));
+    CHECK(queue(1));
+    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0));
+    CHECK(!IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 1, 0));
+
+    // Give every timer time to fire; all are acked, so none resends.
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    CHECK(!resent());
+    IHS_SessionDestroy(session);
+}
+
+// A control-channel reliable packet must keep retransmitting past the 20-attempt cap until it is
+// acknowledged (Steam's own client does), while other channels still give up at the cap.
+void TestControlRetransmitUntilAcked() {
+    IHS_Session *session = MakeLoopbackSession(6);
+    IHS_SessionRetransmission *retransmission = &session->retransmission;
+    auto queueCount = [&](uint16_t packetId, IHS_SessionChannelId channelId, uint8_t count) {
+        IHS_SessionPacket packet{};
+        packet.header.type = IHS_SessionPacketTypeReliable;
+        packet.header.channelId = channelId;
+        packet.header.packetId = packetId;
+        packet.header.retransmitCount = count;
+        packet.header.sendTimestamp = IHS_SessionPacketTimestamp();
+        IHS_SessionPacketBodyInitialize(&packet.body, false);
+        const uint8_t payload[1] = {0};
+        IHS_BufferAppendMem(&packet.body, payload, sizeof(payload));
+        bool queued = IHS_RetransmissionQueue(retransmission, &packet);
+        IHS_SessionPacketClear(&packet, true);
+        return queued;
+    };
+    auto resent = [&] {
+        IHS_MutexLock(session->sendQueueMutex);
+        bool any = !IHS_QueueIsEmpty(session->sendQueue);
+        IHS_MutexUnlock(session->sendQueueMutex);
+        return any;
+    };
+
+    // Control keeps going well past the cap; retransmitCount saturates at 255 instead of wrapping.
+    CHECK(queueCount(200, IHS_SessionChannelIdControl, 25));
+    CHECK(queueCount(201, IHS_SessionChannelIdControl, 254));
+    CHECK(queueCount(202, IHS_SessionChannelIdControl, 255));
+    // Another channel still gives up at the cap.
+    CHECK(!queueCount(210, IHS_SessionChannelIdStats, 20));
+    CHECK(queueCount(211, IHS_SessionChannelIdStats, 5));
+    // Acknowledge everything queued (cumulative) so nothing lingers in the send queue.
+    IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 202, 0);
+    IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdStats, 211, 0);
+
+    // An acked control packet is never resent: the queue stays empty.
+    CHECK(queueCount(301, IHS_SessionChannelIdControl, 1));
+    CHECK(IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 301, 0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    CHECK(!resent());
+
+    // An unacked control packet is resent when its timer fires.
+    CHECK(queueCount(300, IHS_SessionChannelIdControl, 1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    CHECK(resent());
+
+    // Acknowledge it so its resend chain stops before teardown.
+    IHS_RetransmissionCancel(retransmission, IHS_SessionChannelIdControl, 300, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    IHS_SessionDestroy(session);
+}
+
 }  // namespace
 
 int main() {
@@ -984,6 +1134,9 @@ int main() {
     TestFec();
     TestDataChannelGetsPastLostPacket();
     TestRetransmissionCancelRacesTimer();
+    TestFullReportBypassesDedup();
+    TestCumulativeAckCancel();
+    TestControlRetransmitUntilAcked();
     TestSilenceMs();
     TestWakePacket();
     IHS_Quit();

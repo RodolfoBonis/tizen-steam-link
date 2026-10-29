@@ -98,6 +98,8 @@ SessionStats Session::Stats() const {
     s.fec = net.fec;
     s.fecRecovered = net.fecRecovered;
     s.fecUnrecoverable = net.fecUnrecoverable;
+    s.fullReportRequests = net.fullReportRequests;
+    s.retransmitsAbandoned = net.retransmitsAbandoned;
     s.timedOut = net.timedOut;
     s.framerateNum = fpsNum_.load();
     s.framerateDen = fpsDen_.load();

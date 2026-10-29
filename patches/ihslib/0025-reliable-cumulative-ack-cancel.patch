@@ -1,0 +1,92 @@
+Cancel retransmission of every reliable packet an ACK covers, not just the one it names.
+
+Steam acknowledges cumulatively: an ACK for packet n means it has every reliable packet up to
+n. The retransmission queue cancelled only the packet whose id the ACK named, so when a
+packet's own ACK was lost its timer kept resending it until it ran out of attempts, even though
+a later ACK had already told us it arrived. During play, with the control channel carrying
+250 reliable HID reports a second, that wasted a steady slice of the uplink and made a Wi-Fi
+stall worse, which is what tips a held button into a freeze.
+
+IHS_RetransmissionCancel now marks as acked every pending packet on the channel whose id is
+<= the acked one, by 16-bit wraparound ((int16_t)(id - ackId) <= 0), so each one's timer skips
+its resend. The round trip is still sampled only from the exact packet the ACK names, since an
+earlier packet it also covers may have been sent more than once. Marking under the lock keeps
+patch 0019's ownership model: the timer task still frees the item.
+
+diff --git a/src/session/retransmission.c b/src/session/retransmission.c
+index da21947..5907f74 100644
+--- a/src/session/retransmission.c
++++ b/src/session/retransmission.c
+@@ -55,7 +55,7 @@ static void RetransmissionTimerEnd(void *context);
+ 
+ static bool RetransmissionIdenticalPredicate(PendingRetransmission *item, void *context);
+ 
+-static bool RetransmissionPacketPredicate(PendingRetransmission *item, void *context);
++static bool RetransmissionCumulativePredicate(PendingRetransmission *item, void *context);
+ 
+ void IHS_RetransmissionInit(IHS_SessionRetransmission *retransmission, IHS_Session *session) {
+     retransmission->session = session;
+@@ -103,20 +103,31 @@ bool IHS_RetransmissionCancel(IHS_SessionRetransmission *retransmission, IHS_Ses
+             .packetId = packetId,
+             .fragmentId = fragmentId,
+     };
++    // Steam acknowledges cumulatively: an ACK for packetId covers every reliable packet up to it
++    // on the channel. Mark every pending (non-acked) packet on this channel whose id is <= the
++    // acked one, by 16-bit wraparound, so its timer skips the resend. Without this a packet whose
++    // own ACK was lost kept being resent until it ran out of attempts, wasting the uplink.
+     IHS_MutexLock(retransmission->lock);
+-    PendingRetransmission *match = IHS_QueueFindBy(retransmission->queue, RetransmissionPacketPredicate, &query);
++    bool any = false;
++    bool exactMatched = false;
+     uint8_t retransmitCount = 0;
+     uint32_t sendTimestamp = 0;
+-    if (match != NULL) {
++    PendingRetransmission *match;
++    while ((match = IHS_QueueFindBy(retransmission->queue, RetransmissionCumulativePredicate, &query)) != NULL) {
+         match->acked = true;
+-        retransmitCount = match->packet.header.retransmitCount;
+-        sendTimestamp = match->packet.header.sendTimestamp;
++        any = true;
++        // RTT only from the exact packet the ACK names, not an earlier one it also covers.
++        if (match->packet.header.packetId == packetId && match->packet.header.fragmentId == fragmentId) {
++            exactMatched = true;
++            retransmitCount = match->packet.header.retransmitCount;
++            sendTimestamp = match->packet.header.sendTimestamp;
++        }
+     }
+     IHS_MutexUnlock(retransmission->lock);
+-    if (match == NULL) {
++    if (!any) {
+         return false;
+     }
+-    if (retransmitCount == 1) {
++    if (exactMatched && retransmitCount == 1) {
+         // Sent once (the queued copy counts 1), so the ACK can only be for that send. Smoothed
+         // like TCP's SRTT, by 1/8 per sample.
+         IHS_Session *session = retransmission->session;
+@@ -129,7 +140,7 @@ bool IHS_RetransmissionCancel(IHS_SessionRetransmission *retransmission, IHS_Ses
+                               rtt == 0 ? sample : (uint32_t) ((int64_t) rtt + ((int64_t) sample - rtt) / 8));
+     }
+     IHS_SessionLog(retransmission->session, IHS_LogLevelVerbose, "Retransmission",
+-                   "Cancelling Packet(channelId=%u, packetId=%u, fragmentId=%u), retransmitCount=%u",
++                   "Cancelling up to Packet(channelId=%u, packetId=%u, fragmentId=%u), retransmitCount=%u",
+                    channelId, packetId, fragmentId, retransmitCount);
+     return true;
+ }
+@@ -189,9 +200,11 @@ static bool RetransmissionIdenticalPredicate(PendingRetransmission *item, void *
+     return item == context;
+ }
+ 
+-static bool RetransmissionPacketPredicate(PendingRetransmission *item, void *context) {
++static bool RetransmissionCumulativePredicate(PendingRetransmission *item, void *context) {
+     RetransmissionQuery *query = context;
+-    return !item->acked && item->packet.header.channelId == query->channelId &&
+-           item->packet.header.packetId == query->packetId &&
+-           item->packet.header.fragmentId == query->fragmentId;
++    if (item->acked || item->packet.header.channelId != query->channelId) {
++        return false;
++    }
++    // 16-bit wraparound: packetId <= the acked id.
++    return (int16_t) (item->packet.header.packetId - query->packetId) <= 0;
+ }
+\ No newline at end of file

@@ -1,0 +1,104 @@
+Log and count full-report requests and reliable packets dropped after their last retransmit.
+
+Two signs of input trouble left no trace in the log. The host asks for a full HID report
+(RequestFullReport) to resync after a CRC mismatch, which logged at Verbose, below the app's
+Info level. And a reliable packet that ran out of retransmissions was dropped with no log at
+all. During a controller freeze both happen, so nothing showed why.
+
+RequestFullReport now logs at Info with the device id, and a reliable packet dropped after its
+last retransmit logs at Warn with its channel and packet id. Both are rate-limited (the first,
+then every so often) so a storm can't flood the log. Each also bumps a counter in
+IHS_SessionStreamStats, fullReportRequests and retransmitsAbandoned, which the app reads
+through IHS_SessionGetStreamStats and shows in the statistics overlay. The counters live in the
+session, so they stay readable after the data channels are gone.
+
+diff --git a/include/ihslib/session.h b/include/ihslib/session.h
+index d259f66..c7fb97b 100644
+--- a/include/ihslib/session.h
++++ b/include/ihslib/session.h
+@@ -241,6 +241,10 @@ typedef struct IHS_SessionStreamStats {
+     uint32_t fecUnrecoverable;
+     /** The session ended because the host went silent (no packets for 10 s), not by request. */
+     bool timedOut;
++    /** Full HID reports the host asked for (RequestFullReport), to resync after a CRC mismatch. */
++    uint32_t fullReportRequests;
++    /** Reliable packets dropped after running out of retransmissions without an acknowledgement. */
++    uint32_t retransmitsAbandoned;
+ } IHS_SessionStreamStats;
+ 
+ void IHS_SessionGetStreamStats(const IHS_Session *session, IHS_SessionStreamStats *stats);
+diff --git a/src/session/channels/control/control_hid.c b/src/session/channels/control/control_hid.c
+index ec72707..d3014bb 100644
+--- a/src/session/channels/control/control_hid.c
++++ b/src/session/channels/control/control_hid.c
+@@ -527,6 +527,15 @@ static void HandleDeviceRequestFullReport(IHS_SessionChannel *channel, IHS_HIDMa
+         return;
+     }
+ 
++    // The host asks for a full report to resync after a CRC mismatch; a steady stream of these
++    // means input is desyncing. Count every one and log at Info, rate-limited so a storm can't
++    // flood the log (the first, then every 32nd).
++    uint32_t count = IHS_SessionCounterAdd(channel->session->counters.fullReportRequests, 1) + 1;
++    if (count == 1 || count % 32 == 0) {
++        IHS_SessionLog(channel->session, IHS_LogLevelInfo, "HID",
++                       "RequestFullReport(id=%u), %u so far", cmd->device, count);
++    }
++
+     if (IHS_HIDDeviceRequestFullReport(managed->device) == 0) {
+         // Here we assume this device has generated one full report, and send it right away.
+         // This design may require change later...
+diff --git a/src/session/retransmission.c b/src/session/retransmission.c
+index 14a14aa..da21947 100644
+--- a/src/session/retransmission.c
++++ b/src/session/retransmission.c
+@@ -150,9 +150,22 @@ static uint64_t RetransmissionTimerRun(int runCount, void *context) {
+     IHS_MutexUnlock(retransmission->lock);
+     if (!acked) {
+         IHS_SessionPacket *packet = &pending->packet;
+-        IHS_SessionQueuePacket(retransmission->session, packet,
+-                               packet->header.retransmitCount < RETRANSMISSION_ATTEMPTS);
++        bool keepGoing = packet->header.retransmitCount < RETRANSMISSION_ATTEMPTS;
++        IHS_SessionChannelId channelId = packet->header.channelId;
++        uint16_t packetId = packet->header.packetId;
++        IHS_SessionQueuePacket(retransmission->session, packet, keepGoing);
+         assert(packet->body.data == NULL);
++        if (!keepGoing) {
++            // Out of retransmissions and still no ACK: the packet is dropped. On the control
++            // channel a lost reliable packet desyncs HID input, so count these and warn,
++            // rate-limited (the first, then every 16th).
++            uint32_t count = IHS_SessionCounterAdd(retransmission->session->counters.retransmitsAbandoned, 1) + 1;
++            if (count == 1 || count % 16 == 0) {
++                IHS_SessionLog(retransmission->session, IHS_LogLevelWarn, "Retransmission",
++                               "Gave up on Packet(channelId=%u, packetId=%u) after %d attempts, %u abandoned so far",
++                               channelId, packetId, RETRANSMISSION_ATTEMPTS, count);
++            }
++        }
+     }
+     return 0;
+ }
+diff --git a/src/session/session.c b/src/session/session.c
+index 427503b..b1771c5 100644
+--- a/src/session/session.c
++++ b/src/session/session.c
+@@ -214,6 +214,8 @@ void IHS_SessionGetStreamStats(const IHS_Session *session, IHS_SessionStreamStat
+     stats->fecRecovered = IHS_SessionCounterGet(session->counters.fecRecovered);
+     stats->fecUnrecoverable = IHS_SessionCounterGet(session->counters.fecUnrecoverable);
+     stats->timedOut = IHS_SessionCounterGet(session->timedOut);
++    stats->fullReportRequests = IHS_SessionCounterGet(session->counters.fullReportRequests);
++    stats->retransmitsAbandoned = IHS_SessionCounterGet(session->counters.retransmitsAbandoned);
+ }
+ 
+ static void SessionRecvCallback(IHS_Base *base, const IHS_SocketAddress *address, IHS_Buffer *data) {
+diff --git a/src/session/session_pri.h b/src/session/session_pri.h
+index 9b6d772..682b272 100644
+--- a/src/session/session_pri.h
++++ b/src/session/session_pri.h
+@@ -87,6 +87,8 @@ typedef struct IHS_SessionCounters {
+     uint32_t fecShardsLost;
+     uint32_t fecRecovered;
+     uint32_t fecUnrecoverable;
++    uint32_t fullReportRequests;
++    uint32_t retransmitsAbandoned;
+ } IHS_SessionCounters;
+ 
+ #define IHS_SessionCounterAdd(field, n) __atomic_fetch_add(&(field), (n), __ATOMIC_RELAXED)

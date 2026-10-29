@@ -73,6 +73,9 @@ struct SessionStats {
     bool fec = false;
     uint32_t fecRecovered = 0;
     uint32_t fecUnrecoverable = 0;
+    // Full HID reports the host asked for, and reliable packets dropped after their last retransmit.
+    uint32_t fullReportRequests = 0;
+    uint32_t retransmitsAbandoned = 0;
     // The session ended because the host went silent, not by request.
     bool timedOut = false;
 };

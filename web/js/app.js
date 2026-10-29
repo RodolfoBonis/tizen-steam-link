@@ -782,7 +782,9 @@
         return 'loss ' + pct(lost, sent) + ' now, ' + pct(st.videoPacketsLost || 0, total) + ' overall\n' +
             (st.fec ? 'FEC: ' + st.fecRecovered + ' rebuilt, ' + st.fecUnrecoverable + ' lost' : 'FEC: off') +
             '   keyframe requests ' + (st.lostReports || 0) + '\n' +
-            'round trip ' + (st.roundTripMs > 0 ? st.roundTripMs.toFixed(1) + ' ms' : 'not measured yet');
+            'round trip ' + (st.roundTripMs > 0 ? st.roundTripMs.toFixed(1) + ' ms' : 'not measured yet') + '\n' +
+            'input: full-report requests ' + (st.fullReportRequests || 0) +
+            ', retransmits given up ' + (st.retransmitsAbandoned || 0);
     }
 
     // What the TV's player does with the frames: appended, decoded, shown.

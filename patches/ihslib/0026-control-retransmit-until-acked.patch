@@ -1,0 +1,96 @@
+Keep resending a control-channel reliable packet until it is acknowledged.
+
+A reliable packet was resent every 10 ms, at most 20 times, and then dropped. On TV Wi-Fi a
+stall over ~200 ms (a background scan or power save, every few minutes) used up all 20 resends,
+and the packet was lost. On the control channel that packet carries HID input: a lost one
+either blocks the host's ordered channel behind the gap or, once the host skips it, desyncs the
+controller state, which freezes input until the stream recovers. Steam's own client resends
+until the packet is acknowledged, which is why a Steam Deck on the same Wi-Fi doesn't freeze.
+
+Control-channel reliable packets now keep retransmitting with backoff (10 ms doubling, capped
+at 200 ms) until they are acknowledged or the session ends. Other channels still give up after
+20 attempts. retransmitCount is a uint8_t on the wire, so it saturates at 255 instead of
+wrapping, which would reset the backoff. The 10 s host-silence timeout (patch 0016) still ends
+a truly dead session, and session teardown still frees any pending packet (the timer is
+destroyed first, running each task's end callback, then Deinit frees the rest).
+
+diff --git a/src/session/retransmission.c b/src/session/retransmission.c
+index 5907f74..2b25cfd 100644
+--- a/src/session/retransmission.c
++++ b/src/session/retransmission.c
+@@ -28,6 +28,9 @@
+ 
+ #define RETRANSMISSION_INTERVAL 10
+ #define RETRANSMISSION_ATTEMPTS 20
++#define RETRANSMISSION_INTERVAL_MAX 200
++// retransmitCount is uint8_t on the wire; saturate here so it can't wrap.
++#define RETRANSMISSION_COUNT_MAX 255
+ 
+ /*
+  * A pending packet belongs to its timer task: the task's end callback takes it out of the queue
+@@ -57,6 +60,28 @@ static bool RetransmissionIdenticalPredicate(PendingRetransmission *item, void *
+ 
+ static bool RetransmissionCumulativePredicate(PendingRetransmission *item, void *context);
+ 
++// Control-channel reliable packets carry HID input and session control; a lost one desyncs the
++// host (a held button sticks and nothing else gets through), so keep resending until the packet
++// is acked or the session ends, as Steam's own client does. Other channels still give up after
++// RETRANSMISSION_ATTEMPTS. The 10 s host-silence timeout still ends a truly dead session.
++static bool RetransmissionShouldContinue(const IHS_SessionPacket *packet) {
++    if (packet->header.channelId == IHS_SessionChannelIdControl) {
++        return true;
++    }
++    return packet->header.retransmitCount < RETRANSMISSION_ATTEMPTS;
++}
++
++// Back off from 10 ms, doubling, capped at 200 ms, so retransmits during a long outage don't
++// spend the uplink. retransmitCount counts the queued copy as 1, so the first resend waits 10 ms.
++static uint64_t RetransmissionInterval(uint8_t retransmitCount) {
++    unsigned shift = retransmitCount > 0 ? (unsigned) (retransmitCount - 1) : 0;
++    if (shift > 5) {
++        shift = 5;  // 10 << 5 = 320 ms, past the cap anyway
++    }
++    uint64_t interval = (uint64_t) RETRANSMISSION_INTERVAL << shift;
++    return interval > RETRANSMISSION_INTERVAL_MAX ? RETRANSMISSION_INTERVAL_MAX : interval;
++}
++
+ void IHS_RetransmissionInit(IHS_SessionRetransmission *retransmission, IHS_Session *session) {
+     retransmission->session = session;
+     retransmission->lock = IHS_MutexCreate();
+@@ -73,14 +98,16 @@ void IHS_RetransmissionDeinit(IHS_SessionRetransmission *retransmission) {
+ bool IHS_RetransmissionQueue(IHS_SessionRetransmission *retransmission, IHS_SessionPacket *packet) {
+     assert(packet->body.data != NULL);
+     assert(packet->body.offset == IHS_PACKET_HEADER_SIZE);
+-    if (packet->header.retransmitCount >= RETRANSMISSION_ATTEMPTS) {
++    if (!RetransmissionShouldContinue(packet)) {
+         return false;
+     }
+     PendingRetransmission *pending = IHS_QueueItemObtain(retransmission->queue);
+     pending->packet = *packet;
+     pending->retransmission = retransmission;
+     pending->acked = false;
+-    pending->packet.header.retransmitCount++;
++    if (pending->packet.header.retransmitCount < RETRANSMISSION_COUNT_MAX) {
++        pending->packet.header.retransmitCount++;
++    }
+     IHS_BufferTransferOwnership(&packet->body, &pending->packet.body);
+     IHS_SessionLog(retransmission->session, IHS_LogLevelVerbose, "Retransmission",
+                    "Queued Packet(channelId=%u, packetId=%u, fragmentId=%u), retransmitCount=%u",
+@@ -92,7 +119,7 @@ bool IHS_RetransmissionQueue(IHS_SessionRetransmission *retransmission, IHS_Sess
+     IHS_QueueAppend(retransmission->queue, pending);
+     IHS_MutexUnlock(retransmission->lock);
+     IHS_TimerTaskStart(retransmission->session->timers, RetransmissionTimerRun, RetransmissionTimerEnd,
+-                       RETRANSMISSION_INTERVAL, pending);
++                       RetransmissionInterval(pending->packet.header.retransmitCount), pending);
+     return true;
+ }
+ 
+@@ -161,7 +188,7 @@ static uint64_t RetransmissionTimerRun(int runCount, void *context) {
+     IHS_MutexUnlock(retransmission->lock);
+     if (!acked) {
+         IHS_SessionPacket *packet = &pending->packet;
+-        bool keepGoing = packet->header.retransmitCount < RETRANSMISSION_ATTEMPTS;
++        bool keepGoing = RetransmissionShouldContinue(packet);
+         IHS_SessionChannelId channelId = packet->header.channelId;
+         uint16_t packetId = packet->header.packetId;
+         IHS_SessionQueuePacket(retransmission->session, packet, keepGoing);

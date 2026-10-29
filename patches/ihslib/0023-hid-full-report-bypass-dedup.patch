@@ -1,0 +1,70 @@
+Always send a requested full HID report, even when the pad state is unchanged.
+
+When the host's copy of a controller's state fails the CRC check carried with each delta, it
+asks the client for a full report (RequestFullReport) to resync. The client answers by packing
+the pad's current state as a full report. But the dedup added upstream dropped any report,
+full ones included, whose bytes matched the last one flushed, and the pad state usually hasn't
+changed since the last send. So the full report the host asked for was silently dropped, the
+host stayed on its stale state, every later delta failed the CRC check the same way, and the
+input "froze": a button held at that moment stayed pressed on the host and nothing else got
+through. Recovery only happened when a request happened to land in the few milliseconds after
+the pad changed but before the change was sent, which stick noise eventually made happen.
+
+IHS_HIDReportHolderAddFull now always queues the report, with no dedup. It still stashes the
+state as the pending current one, so a later delta dedups against it correctly. Deltas keep
+the dedup, which only ever drops a no-op delta.
+
+diff --git a/src/hid/report.c b/src/hid/report.c
+index 00d9a6a..163d266 100644
+--- a/src/hid/report.c
++++ b/src/hid/report.c
+@@ -60,14 +60,9 @@ void IHS_HIDReportHolderDeinit(IHS_HIDReportHolder *holder) {
+     free(holder->pendingCurrent);
+ }
+ 
+-// Capture `current` as the pending state for the next send and decide whether to skip
+-// because the bytes are byte-identical to what was last flushed. Allocates the two scratch
+-// buffers lazily and grows them on demand. Returns true if the caller should drop.
+-static bool DedupAndStash(IHS_HIDReportHolder *holder, const uint8_t *current, size_t len) {
+-    if (holder->lastSent != NULL && holder->lastSentLen == len &&
+-        memcmp(holder->lastSent, current, len) == 0) {
+-        return true;
+-    }
++// Capture `current` as the pending state for the next send. Allocates the two scratch buffers
++// lazily and grows them on demand.
++static void StashCurrent(IHS_HIDReportHolder *holder, const uint8_t *current, size_t len) {
+     if (len > holder->bufferCapacity) {
+         holder->lastSent = realloc(holder->lastSent, len);
+         holder->pendingCurrent = realloc(holder->pendingCurrent, len);
+@@ -75,6 +70,16 @@ static bool DedupAndStash(IHS_HIDReportHolder *holder, const uint8_t *current, s
+     }
+     memcpy(holder->pendingCurrent, current, len);
+     holder->pendingCurrentLen = len;
++}
++
++// Stash `current` as the pending state and decide whether to skip it because the bytes are
++// byte-identical to what was last flushed. Returns true if the caller should drop.
++static bool DedupAndStash(IHS_HIDReportHolder *holder, const uint8_t *current, size_t len) {
++    if (holder->lastSent != NULL && holder->lastSentLen == len &&
++        memcmp(holder->lastSent, current, len) == 0) {
++        return true;
++    }
++    StashCurrent(holder, current, len);
+     return false;
+ }
+ 
+@@ -84,9 +89,11 @@ void IHS_HIDReportHolderSetReportLength(IHS_HIDReportHolder *holder, size_t repo
+ 
+ void IHS_HIDReportHolderAddFull(IHS_HIDReportHolder *holder, const uint8_t *current, size_t len) {
+     assert(holder->reportLength >= len);
+-    if (DedupAndStash(holder, current, len)) {
+-        return;
+-    }
++    // Always queue a full report, even when the bytes equal the last send. The host asks for one
++    // (RequestFullReport) after a CRC mismatch to resync, and the pad state usually hasn't changed
++    // since the last send; dropping it as a duplicate leaves the host stuck on its stale copy,
++    // which fails every later delta's CRC check. Still stash it so later deltas dedup correctly.
++    StashCurrent(holder, current, len);
+     uint8_t *data = IHS_BufferPointerForAppend(&holder->dataBuffer, len);
+     memcpy(data, current, len);
+     holder->dataBuffer.size += len;
